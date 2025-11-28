@@ -5,6 +5,7 @@ import psycopg
 import pandas
 import time
 import re
+import chardet
 from typing import Dict, List, Optional
 
 class HospitalChargeETLCSV:
@@ -64,6 +65,7 @@ class HospitalChargeETLCSV:
     db_connection_str: str
     hospital_license_number: str
     column_mapping: dict
+    file_encoding: str
 
     def __init__(self, db_connection_str: str):
         self.db_connection_str = db_connection_str
@@ -72,6 +74,13 @@ class HospitalChargeETLCSV:
         if not s:
             return ""
         return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    def detect_encoding(self, file_path) -> str | None:
+        with open(file_path, 'rb') as f:
+            raw_data = f.read(100000)
+            result = chardet.detect(raw_data)
+            encoding = result['encoding']
+            return encoding
 
     def discover_columns(self, columns: list[str]) -> dict:
         mapping = {
@@ -136,13 +145,15 @@ class HospitalChargeETLCSV:
         return mapping
     
     def read_hospital_data(self, file_path: str) -> dict:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        self.encoding = self.detect_encoding(file_path)
+        print(f"Detected {self.encoding} encoding")
+        with open(file_path, 'r', encoding=self.encoding) as f:
             reader = csv.reader(f)
             header_row = next(reader)
             data_row = next(reader)            
             return dict(zip(header_row, data_row))
             
-    def upsert_hospital_data(self, metadata: dict):
+    def upsert_hospital_data(self, metadata: dict[str, str]):
         hospital_license_number = ""
         hospital_name = None
         hospital_address = None
@@ -154,7 +165,7 @@ class HospitalChargeETLCSV:
         for key in metadata.keys():
             normalized = self.normalize_string(key)
             if "license" in normalized and "number" in normalized:
-                hospital_license_number = metadata[key] + "|OH"
+                hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|OH"
             elif "name" in normalized:
                 hospital_name = metadata[key]
             elif "address" in normalized:
@@ -171,11 +182,19 @@ class HospitalChargeETLCSV:
         with psycopg.connect(self.db_connection_str) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
+                    DELETE FROM standard_charges
+                    WHERE hospital_license_number = (%s)
+                """, (hospital_license_number,))
+                cur.execute("""
+                    DELETE FROM payer_charges
+                    WHERE hospital_license_number = (%s)
+                """, (hospital_license_number,))
+                cur.execute("""
                     INSERT INTO HOSPITALS (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (hospital_license_number)
                     DO UPDATE SET
-                        hospital_name = EXCLUDED.hospital_name,
+                        hospital_name = EXCLUDED.hospital_name, 
                         hospital_address = EXCLUDED.hospital_address,
                         hospital_location = EXCLUDED.hospital_location,
                         as_of_date = EXCLUDED.as_of_date,
@@ -229,7 +248,7 @@ class HospitalChargeETLCSV:
         
         # Discover columns from file
         print("Discovering column structure...")
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding=self.encoding) as f:
             next(f)  # Skip hospital metadata
             next(f)
             charge_header = next(csv.reader(f))
@@ -245,7 +264,7 @@ class HospitalChargeETLCSV:
         
         # Read and filter in chunks
         print("\nReading and filtering CSV...")
-        chunks = pandas.read_csv(file_path, skiprows=2, encoding="latin1", 
+        chunks = pandas.read_csv(file_path, skiprows=2, encoding=self.encoding, 
                             chunksize=100000, dtype=str, low_memory=False)
         filtered_chunks = []
 
@@ -396,13 +415,14 @@ class HospitalChargeETLCSV:
                     methodology = row[self.column_mapping['methodology']] if self.column_mapping['methodology'] else None
                     additional_notes = row[self.column_mapping['additional_notes']] if self.column_mapping['additional_notes'] else None
                     
-                    payer_charges_batch.append((
-                        service_id,
-                        self.hospital_license_number, 
-                        payer_name, plan_name, modifiers,
-                        negotiated_dollar, negotiated_algorithm, negotiated_percentage,
-                        estimated_amount, methodology, additional_notes
-                    ))
+                    if payer_name is not None and plan_name is not None:
+                        payer_charges_batch.append((
+                            service_id,
+                            self.hospital_license_number, 
+                            payer_name, plan_name, modifiers,
+                            negotiated_dollar, negotiated_algorithm, negotiated_percentage,
+                            estimated_amount, methodology, additional_notes
+                        ))
 
                     num_records += 1
                     
@@ -502,16 +522,18 @@ if __name__ == "__main__":
         db_connection_str = f.readline()
     
     etl = HospitalChargeETLCSV(db_connection_str)
-    
+
+    file_path = "../MachineReadableFiles/metrohealth-system_standardcharges.csv"
+
     print("Reading hospital metadata...")
-    hospital_dict = etl.read_hospital_data("../MachineReadableFiles/metrohealth-system_standardcharges.csv")
+    hospital_dict = etl.read_hospital_data(file_path)
     
     print("Upserting hospital data...")
     etl.upsert_hospital_data(hospital_dict)
     
     print("Filtering services from CSV...")
     filter_start = time.time()
-    df = etl.filter_services("../MachineReadableFiles/metrohealth-system_standardcharges.csv")    
+    df = etl.filter_services(file_path)    
     filter_time = time.time() - filter_start
     print(f"Filtered {len(df)} records in {filter_time:.2f}s")
     
