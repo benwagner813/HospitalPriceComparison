@@ -5,10 +5,17 @@ import psycopg
 import pandas
 import time
 import re
-import chardet
+import traceback
 from typing import Dict, List, Optional
 
 class HospitalChargeETLCSV:
+    """
+    ETL process for hospital charge CSV files.
+
+    Usage:
+        etl = HospitalChargeETLCSV(db_connection_str, file_path)
+        etl.execute()
+    """
 
     ALLOWED_CPT_HCPCS_CODES = {
         '19120', '29826', '29881', '33206', '33207', '33208', '33274', '36415', '42820',
@@ -62,98 +69,102 @@ class HospitalChargeETLCSV:
     
     ALLOWED_TYPES = {'MS-DRG', 'APR-DRG', 'CPT', 'HCPCS'}
 
-    db_connection_str: str
-    hospital_license_number: str
-    column_mapping: dict
-    file_encoding: str
+    def __init__(self, db_connection_str: str, file_path: str):
+        """
+        Initialize the ETL process
+        
+        :param db_connection_str: string to connect to postgresql database using psycopg
+        :type db_connection_str: str
+        :param file_path: path to the hospital charge CSV
+        :type file_path: str
+        """
 
-    def __init__(self, db_connection_str: str):
         self.db_connection_str = db_connection_str
+        self.file_path = file_path
 
-    def normalize_string(self, s: str) -> str:
-        if not s:
-            return ""
-        return re.sub(r'[^a-z0-9]', '', s.lower())
+        # State tracking
+        self.hospital_license_number = None
+        self.encoding = 'latin1'
+        self.column_mapping = {}
+        self.filtered_data = None
 
-    def detect_encoding(self, file_path) -> str | None:
-        with open(file_path, 'rb') as f:
-            raw_data = f.read(100000)
-            result = chardet.detect(raw_data)
-            encoding = result['encoding']
-            return encoding
+        self.total_rows_processed = 0
+        self.total_rows_kept = 0
+        self.total_rows_found = 0
+        
 
-    def discover_columns(self, columns: list[str]) -> dict:
-        mapping = {
-            "code_columns": [],
-            "type_columns": [],
-            "setting": None,
-            "description": None,
-            "payer_name": None,
-            "plan_name": None,
-            "modifiers": None,
-            "gross": None,
-            "discounted_cash": None,
-            "min": None,
-            "max": None,
-            "negotiated_dollar": None,
-            "negotiated_percentage": None,
-            "negotiated_algorithm": None,
-            "estimated_amount": None,
-            "methodology": None,
-            "additional_notes": None,
-        }
+    def execute(self, skip_confirmation: bool = False) -> dict:
+        """
+        Execute the complete ETL process
+        
+        :param skip_confirmation: If true, do not prompt for confirmation on warnings
+        :type skip_confirmation: bool
+        :return: Summary of execution results
+        :rtype: dict[Any, Any]
+        """
+        print("="*70)
+        print("HOSPITAL CHARGE ETL PROCESS")
+        print("="*70)
+        print(f"File: {self.file_path}")
+        print()
 
-        for col in columns:
-            normalized = self.normalize_string(col)
+        overall_start = time.time()
 
-            if re.match(r'code\d+$', normalized):
-                mapping["code_columns"].append(col)
-            elif re.match(r'code\d+type$', normalized):
-                mapping["type_columns"].append(col)
-            elif "setting" in normalized:
-                mapping["setting"] = col
-            elif "description" in normalized or normalized == "desc":
-                mapping["description"] = col
-            elif "payer" in normalized and "name" in normalized:
-                mapping["payer_name"] = col
-            elif "plan" in normalized and "name" in normalized:
-                mapping["plan_name"] = col
-            elif "modifier" in normalized:
-                mapping["modifiers"] = col
-            elif "gross" in normalized:
-                mapping["gross"] = col
-            elif "discounted" in normalized:
-                mapping["discounted_cash"] = col
-            elif "min" in normalized:
-                mapping["min"] = col
-            elif "max" in normalized:
-                mapping["max"] = col
-            elif "negotiated" in normalized:
-                if "dollar" in normalized:
-                    mapping["negotiated_dollar"] = col
-                elif "percent" in normalized:
-                    mapping["negotiated_percentage"] = col
-                elif "algorithm" in normalized:
-                    mapping["negotiated_algorithm"] = col
-            elif "estimated" in normalized:
-                mapping["estimated_amount"] = col
-            elif "methodology" in normalized:
-                mapping["methodology"] = col
-            elif "note" in normalized:
-                mapping["additional_notes"] = col
+        try:
+            print("STEP 1: Loading and inserting hospital metadata")
+            hospital_dict = self._read_hospital_data()
+            self._upsert_hospital_data(hospital_dict)
 
-        return mapping
+            print("\nSTEP 2: Filtering charge data...")
+            filter_start = time.time()
+            filtered_data = self._filter_services()
+            filter_time = time.time() - filter_start
+            print(f"Filtering complete in {filter_time:.2f}s")
+            
+            print("\nSTEP 3: Inserting charge data into database...")
+            self._arrange_charge_data(filtered_data)
+
+            overall_time = time.time() - overall_start
+
+            print("\n" + "="*70)
+            print("ETL PROCESS COMPLETE")
+            print("="*70)
+            print(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
+            print(f"Hospital: {self.hospital_license_number}")
+            print(f"Records inserted: {self.total_rows_found:,}")
+
+            return {
+                'status': 'success',
+                'execution_time': overall_time,
+                'hospital_license_number': self.hospital_license_number,
+                'records_processed': self.total_rows_processed,
+                'records_inserted': self.total_rows_found,
+            }
+        
+        except Exception as e:
+            print(f"\nETL pipeline failed: {e}")
+            traceback.print_exc()
+            
+            return {
+                'status': 'failed',
+                'error': str(e),
+            }
+
+    # Private Methods
     
-    def read_hospital_data(self, file_path: str) -> dict:
-        self.encoding = self.detect_encoding(file_path)
-        print(f"Detected {self.encoding} encoding")
-        with open(file_path, 'r', encoding=self.encoding) as f:
+    def _read_hospital_data(self) -> dict:
+        """Read hospital metadata from the first two rows of the CSV"""
+
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
             reader = csv.reader(f)
             header_row = next(reader)
-            data_row = next(reader)            
+            data_row = next(reader)
+
             return dict(zip(header_row, data_row))
             
-    def upsert_hospital_data(self, metadata: dict[str, str]):
+    def _upsert_hospital_data(self, metadata: dict[str, str]):
+        """Upsert hospital metadata into database"""
+        
         hospital_license_number = ""
         hospital_name = None
         hospital_address = None
@@ -163,7 +174,7 @@ class HospitalChargeETLCSV:
         version = None
         
         for key in metadata.keys():
-            normalized = self.normalize_string(key)
+            normalized = self._normalize_string(key)
             if "license" in normalized and "number" in normalized:
                 hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|OH"
             elif "name" in normalized:
@@ -201,70 +212,35 @@ class HospitalChargeETLCSV:
                         last_update = EXCLUDED.last_update,
                         version = EXCLUDED.version
                 """, (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version))
-                    
-    def normalize_code_type(self, code_type: str) -> Optional[str]:
-        if not code_type or (isinstance(code_type, float) and pandas.isna(code_type)):
-            return None
-        
-        # Convert to string if not already
-        code_type = str(code_type)
-    
-        normalized = code_type.upper().strip()
-        # Handle variations like "APR-DRG" vs "APRDRG"
-        normalized = normalized.replace('-', '').replace('_', '').replace(' ', '')
-        
-        type_mappings = {
-            'MSDRG': 'MS-DRG',
-            'MS_DRG': 'MS-DRG',
-            'APRDRG': 'APR-DRG',
-            'APR_DRG': 'APR-DRG',
-            'CPT': 'CPT',
-            'HCPCS': 'HCPCS',
-        }
-        
-        return type_mappings.get(normalized, code_type.upper().strip())
 
-    def normalize_setting(self, setting: str) -> Optional[str]:
-        if not setting or (isinstance(setting, float) and pandas.isna(setting)):
-            return None
-        
-        # Convert to string if not already
-        setting = str(setting)
-        
-        normalized = setting.lower().strip()
-        
-        if 'inpatient' in normalized or normalized == 'in':
-            return 'Inpatient'
-        elif 'outpatient' in normalized or normalized == 'out':
-            return 'Outpatient'
-        elif 'both' in normalized:
-            return 'Both'  # Special marker for duplication
-        
-        # Default: capitalize first letter
-        return setting.capitalize()
-
-    def filter_services(self, file_path: str) -> pandas.DataFrame:
+    def _filter_services(self) -> pandas.DataFrame:
         """Filter services with flexible column discovery and vectorized operations"""
-        
+
         # Discover columns from file
         print("Discovering column structure...")
-        with open(file_path, 'r', encoding=self.encoding) as f:
+        with open(self.file_path, 'r', encoding=self.encoding) as f:
             next(f)  # Skip hospital metadata
             next(f)
             charge_header = next(csv.reader(f))
         
-        self.column_mapping = self.discover_columns(charge_header)
+        self.column_mapping = self._discover_columns(charge_header)
         
-        print("Column mapping discovered:")
+        print("\n" + "="*70)
+        print("COLUMN MAPPING RESULTS")
+        print("="*70)
+        print(f"Encoding: {self.encoding}")
         for key, val in self.column_mapping.items():
             if isinstance(val, list) and len(val) > 3:
                 print(f"  {key}: {val[:3]}... ({len(val)} total)")
             else:
                 print(f"  {key}: {val}")
         
-        # Read and filter in chunks
-        print("\nReading and filtering CSV...")
-        chunks = pandas.read_csv(file_path, skiprows=2, encoding=self.encoding, 
+        print("\n" + "="*70)
+        print("PROCESSING CSV DATA")
+        print("="*70)
+
+        # Read and filter chunks
+        chunks = pandas.read_csv(self.file_path, skiprows=2, encoding=self.encoding, 
                             chunksize=100000, dtype=str, low_memory=False)
         filtered_chunks = []
 
@@ -272,20 +248,19 @@ class HospitalChargeETLCSV:
         kept_rows = 0
         
         for chunk_num, chunk in enumerate(chunks, 1):
-            total_rows += len(chunk)
+            chunk_total = len(chunk)
+            total_rows += chunk_total
+            self.total_rows_processed += chunk_total
             
-            # Add columns to store matched code and type for later use
+            print(f"  Chunk {chunk_num}: Processing {chunk_total:,} rows...", end=' ')
+            
+            # Add tracking columns
             chunk['_matched_code'] = None
             chunk['_matched_type'] = None
             
-            # Normalize code types across all code columns
-            for type_col in self.column_mapping['type_columns']:
-                if type_col in chunk.columns:
-                    chunk[type_col] = chunk[type_col].apply(self.normalize_code_type)
-            
             # Normalize setting
             if self.column_mapping['setting'] in chunk.columns:
-                chunk[self.column_mapping['setting']] = chunk[self.column_mapping['setting']].apply(self.normalize_setting)
+                chunk[self.column_mapping['setting']] = chunk[self.column_mapping['setting']].apply(self._normalize_setting)
             
             # Build filter condition and capture matched code/type
             filter_condition = pandas.Series([False] * len(chunk), index=chunk.index)
@@ -322,8 +297,11 @@ class HospitalChargeETLCSV:
                 
                 filter_condition = filter_condition | matches
             
+            
             filtered_chunk = chunk[filter_condition]
-            kept_rows += len(filtered_chunk)
+            chunk_kept = len(filtered_chunk)
+            kept_rows += chunk_kept
+            self.total_rows_kept += chunk_kept
             
             if len(filtered_chunk) > 0:
                 # Handle "Both" settings by duplicating rows
@@ -345,21 +323,22 @@ class HospitalChargeETLCSV:
                     # Combine all rows
                     filtered_chunk = pandas.concat([normal_rows, inpatient_rows, outpatient_rows], ignore_index=True)
                     
-                    print(f"    Duplicated {both_mask.sum()} 'Both' records into Inpatient/Outpatient")
-                
+                    
+                self.total_rows_found += len(filtered_chunk)
                 filtered_chunks.append(filtered_chunk)
             
-            print(f"  Chunk {chunk_num}: {len(chunk)} rows -> {len(filtered_chunk)} kept")
+            print(f"{chunk_total:,} rows -> {chunk_kept:,} kept")
         
-        print(f"\nTotal: {total_rows} rows -> {kept_rows} kept ({100*kept_rows/total_rows:.1f}%)")
+        print(f"\nTotal: {total_rows:,} rows -> {kept_rows:,} kept")
         
         if not filtered_chunks:
+            print("\nERROR: No data kept after filtering!")
             return pandas.DataFrame()
         
         chargeData = pandas.concat(filtered_chunks, ignore_index=True)
         return chargeData.where(chargeData.notnull(), None)
-    
-    def arrange_charge_data(self, chargeData: pandas.DataFrame):
+                    
+    def _arrange_charge_data(self, chargeData: pandas.DataFrame):
         """Process charge data with flexible column mapping"""
         
         start_time = time.time()
@@ -427,7 +406,7 @@ class HospitalChargeETLCSV:
                     num_records += 1
                     
                     if num_records % 5000 == 0:
-                        batch_counts = self.execute_batch_upserts(cur, services_batch, standard_charges_batch, payer_charges_batch)
+                        batch_counts = self._execute_batch_upserts(cur, services_batch, standard_charges_batch, payer_charges_batch)
                         total_services_inserted += batch_counts[0]
                         total_standard_charges_inserted += batch_counts[1]
                         total_payer_charges_inserted += batch_counts[2]
@@ -437,11 +416,8 @@ class HospitalChargeETLCSV:
                         total_time = batch_end - start_time
                         avg_time_per_record = total_time / num_records
                         
-                        print(f"Processed {num_records} records in {total_time:.2f}s "
+                        print(f"Processed {num_records:,} records in {total_time:.2f}s "
                               f"(batch: {batch_time:.2f}s, avg: {avg_time_per_record*1000:.2f}ms/record)")
-                        print(f"  Actual inserts - Services: {total_services_inserted}, "
-                              f"Standard: {total_standard_charges_inserted}, "
-                              f"Payer: {total_payer_charges_inserted}")
                         
                         services_batch = []
                         standard_charges_batch = []
@@ -449,7 +425,7 @@ class HospitalChargeETLCSV:
                         batch_start = time.time()
                 
                 if services_batch:
-                    batch_counts = self.execute_batch_upserts(cur, services_batch, standard_charges_batch, payer_charges_batch)
+                    batch_counts = self._execute_batch_upserts(cur, services_batch, standard_charges_batch, payer_charges_batch)
                     total_services_inserted += batch_counts[0]
                     total_standard_charges_inserted += batch_counts[1]
                     total_payer_charges_inserted += batch_counts[2]
@@ -458,17 +434,17 @@ class HospitalChargeETLCSV:
                 
                 end_time = time.time()
                 total_time = end_time - start_time
-                print(f"\n=== Total Insertion Complete ===")
-                print(f"Total records processed: {num_records}")
+                print(f"\n=== Insertion Complete ===")
+                print(f"Total records processed: {num_records:,}")
                 print(f"Actual insertions:")
-                print(f"  Services: {total_services_inserted} (conflicts: {num_records - total_services_inserted})")
-                print(f"  Standard Charges: {total_standard_charges_inserted} (conflicts: {num_records - total_standard_charges_inserted})")
-                print(f"  Payer Charges: {total_payer_charges_inserted} (conflicts: {num_records - total_payer_charges_inserted})")
+                print(f"  Services: {total_services_inserted:,}")
+                print(f"  Standard Charges: {total_standard_charges_inserted:,}")
+                print(f"  Payer Charges: {total_payer_charges_inserted:,}")
                 print(f"Total time: {total_time:.2f}s")
-                print(f"Average time per record: {(total_time/num_records)*1000:.2f}ms")
                 print(f"Records per second: {num_records/total_time:.2f}")
 
-    def execute_batch_upserts(self, cur, services_batch, standard_charges_batch, payer_charges_batch):
+    def _execute_batch_upserts(self, cur, services_batch, standard_charges_batch, payer_charges_batch):
+        """Execute batch upserts for all three tables"""
         services_inserted = 0
         standard_charges_inserted = 0
         payer_charges_inserted = 0
@@ -512,6 +488,100 @@ class HospitalChargeETLCSV:
         
         return (services_inserted, standard_charges_inserted, payer_charges_inserted)
 
+    # Utility Methods
+
+    def _normalize_string(self, s: str) -> str:
+        """Normalize string for comparison (remove non-alphanumeric, change to lowercase)"""
+        if not s:
+            return ""
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    def _discover_columns(self, columns: list[str]) -> dict:
+        """Discover column mappings from CSV headers"""
+        mapping = {
+        "code_columns": [], "type_columns": [],
+        "setting": None, "description": None,
+        "payer_name": None, "plan_name": None, "modifiers": None,
+        "gross": None, "discounted_cash": None,
+        "min": None, "max": None,
+        "negotiated_dollar": None, "negotiated_percentage": None, 
+        "negotiated_algorithm": None,
+        "estimated_amount": None, "methodology": None, "additional_notes": None,
+        }
+        
+        for col in columns:
+            normalized = self._normalize_string(col)
+
+            if re.match(r'code\d+$', normalized):
+                mapping["code_columns"].append(col)
+
+            elif re.match(r'code\d+type$', normalized):
+                mapping["type_columns"].append(col)
+
+            elif "setting" in normalized:
+                mapping["setting"] = col
+
+            elif "description" in normalized or normalized == "desc":
+                mapping["description"] = col
+
+            elif "payer" in normalized and "name" in normalized:
+                mapping["payer_name"] = col
+
+            elif "plan" in normalized and "name" in normalized:
+                mapping["plan_name"] = col
+
+            elif "modifier" in normalized:
+                mapping["modifiers"] = col
+
+            elif "gross" in normalized:
+                mapping["gross"] = col
+
+            elif "discounted" in normalized:
+                mapping["discounted_cash"] = col
+
+            elif "min" in normalized:
+                mapping["min"] = col
+
+            elif "max" in normalized:
+                mapping["max"] = col
+
+            elif "negotiated" in normalized:
+                if "dollar" in normalized:
+                    mapping["negotiated_dollar"] = col
+
+                elif "percent" in normalized:
+                    mapping["negotiated_percentage"] = col
+
+                elif "algorithm" in normalized:
+                    mapping["negotiated_algorithm"] = col
+
+            elif "estimated" in normalized:
+                mapping["estimated_amount"] = col
+
+            elif "methodology" in normalized:
+                mapping["methodology"] = col
+
+            elif "note" in normalized:
+                mapping["additional_notes"] = col
+            
+        return mapping
+
+    def _normalize_setting(self, setting: str) -> Optional[str]:
+        """Normalize setting values"""
+        if not setting or (isinstance(setting, float) and pandas.isna(setting)):
+            return None
+        
+        normalized = setting.lower().strip()
+        
+        if 'inpatient' in normalized:
+            return 'Inpatient'
+        elif 'outpatient' in normalized:
+            return 'Outpatient'
+        elif 'both' in normalized:
+            return 'Both'  # Special marker for duplication
+        
+        # Default: capitalize first letter
+        return setting.capitalize()
 
 if __name__ == "__main__":
     print("Starting ETL process...")
@@ -521,25 +591,9 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    etl = HospitalChargeETLCSV(db_connection_str)
+    file_path = "../MachineReadableFiles/31-1322863_JAMES-CANCER-HOSPITAL_standardcharges.csv"
 
-    file_path = "../MachineReadableFiles/metrohealth-system_standardcharges.csv"
+    etl = HospitalChargeETLCSV(db_connection_str, file_path)
+    result = etl.execute()
+    print(result)
 
-    print("Reading hospital metadata...")
-    hospital_dict = etl.read_hospital_data(file_path)
-    
-    print("Upserting hospital data...")
-    etl.upsert_hospital_data(hospital_dict)
-    
-    print("Filtering services from CSV...")
-    filter_start = time.time()
-    df = etl.filter_services(file_path)    
-    filter_time = time.time() - filter_start
-    print(f"Filtered {len(df)} records in {filter_time:.2f}s")
-    
-    print("\nStarting charge data insertion...")
-    etl.arrange_charge_data(df)
-    
-    overall_time = time.time() - overall_start
-    print(f"\n=== ETL Process Complete ===")
-    print(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
