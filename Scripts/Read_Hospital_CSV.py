@@ -6,7 +6,9 @@ import pandas
 import time
 import re
 import traceback
+import logging
 from typing import Dict, List, Optional
+
 
 class HospitalChargeETLCSV:
     """
@@ -78,7 +80,8 @@ class HospitalChargeETLCSV:
         :param file_path: path to the hospital charge CSV
         :type file_path: str
         """
-
+        logging.basicConfig(filename="../Logs/ETLLogs.log", level=logging.INFO)
+        self.logger = logging.getLogger("ETL Logger")
         self.db_connection_str = db_connection_str
         self.file_path = file_path
 
@@ -102,36 +105,35 @@ class HospitalChargeETLCSV:
         :return: Summary of execution results
         :rtype: dict[Any, Any]
         """
-        print("="*70)
-        print("HOSPITAL CHARGE ETL PROCESS")
-        print("="*70)
-        print(f"File: {self.file_path}")
-        print()
+        self.logger.info("="*70)
+        self.logger.info("HOSPITAL CHARGE ETL PROCESS")
+        self.logger.info("="*70)
+        self.logger.info(f"File: {self.file_path}")
 
         overall_start = time.time()
 
         try:
-            print("STEP 1: Loading and inserting hospital metadata")
+            self.logger.info("STEP 1: Loading and inserting hospital metadata")
             hospital_dict = self._read_hospital_data()
             self._upsert_hospital_data(hospital_dict)
 
-            print("\nSTEP 2: Filtering charge data...")
+            self.logger.info("\nSTEP 2: Filtering charge data...")
             filter_start = time.time()
             filtered_data = self._filter_services()
             filter_time = time.time() - filter_start
-            print(f"Filtering complete in {filter_time:.2f}s")
+            self.logger.info(f"Filtering complete in {filter_time:.2f}s")
             
-            print("\nSTEP 3: Inserting charge data into database...")
+            self.logger.info("\nSTEP 3: Inserting charge data into database...")
             self._arrange_charge_data(filtered_data)
 
             overall_time = time.time() - overall_start
 
-            print("\n" + "="*70)
-            print("ETL PROCESS COMPLETE")
-            print("="*70)
-            print(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
-            print(f"Hospital: {self.hospital_license_number}")
-            print(f"Records inserted: {self.total_rows_found:,}")
+            self.logger.info("\n" + "="*70)
+            self.logger.info("ETL PROCESS COMPLETE")
+            self.logger.info("="*70)
+            self.logger.info(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
+            self.logger.info(f"Hospital: {self.hospital_license_number}")
+            self.logger.info(f"Records inserted: {self.total_rows_found:,}\n\n\n")
 
             return {
                 'status': 'success',
@@ -142,7 +144,7 @@ class HospitalChargeETLCSV:
             }
         
         except Exception as e:
-            print(f"\nETL pipeline failed: {e}")
+            self.logger.info(f"\nETL pipeline failed: {e}")
             traceback.print_exc()
             
             return {
@@ -221,7 +223,7 @@ class HospitalChargeETLCSV:
         """Filter services with flexible column discovery and vectorized operations"""
 
         # Discover columns from file
-        print("Discovering column structure...")
+        self.logger.info("Discovering column structure...")
         with open(self.file_path, 'r', encoding=self.encoding) as f:
             next(f)  # Skip hospital metadata
             next(f)
@@ -229,19 +231,19 @@ class HospitalChargeETLCSV:
         
         self.column_mapping = self._discover_columns(charge_header)
         
-        print("\n" + "="*70)
-        print("COLUMN MAPPING RESULTS")
-        print("="*70)
-        print(f"Encoding: {self.encoding}")
+        self.logger.info("\n" + "="*70)
+        self.logger.info("COLUMN MAPPING RESULTS")
+        self.logger.info("="*70)
+        self.logger.info(f"Encoding: {self.encoding}")
         for key, val in self.column_mapping.items():
             if isinstance(val, list) and len(val) > 3:
-                print(f"  {key}: {val[:3]}... ({len(val)} total)")
+                self.logger.info(f"  {key}: {val[:3]}... ({len(val)} total)")
             else:
-                print(f"  {key}: {val}")
+                self.logger.info(f"  {key}: {val}")
         
-        print("\n" + "="*70)
-        print("PROCESSING CSV DATA")
-        print("="*70)
+        self.logger.info("\n" + "="*70)
+        self.logger.info("PROCESSING CSV DATA")
+        self.logger.info("="*70)
 
         # Read and filter chunks
         chunks = pandas.read_csv(self.file_path, skiprows=2, encoding=self.encoding, 
@@ -256,7 +258,7 @@ class HospitalChargeETLCSV:
             total_rows += chunk_total
             self.total_rows_processed += chunk_total
             
-            print(f"  Chunk {chunk_num}: Processing {chunk_total:,} rows...", end=' ')
+            self.logger.info(f"  Chunk {chunk_num}: Processing {chunk_total:,} rows...")
             
             # Add tracking columns
             chunk['_matched_code'] = None
@@ -331,12 +333,12 @@ class HospitalChargeETLCSV:
                 self.total_rows_found += len(filtered_chunk)
                 filtered_chunks.append(filtered_chunk)
             
-            print(f"{chunk_total:,} rows -> {chunk_kept:,} kept")
+            self.logger.info(f"{chunk_total:,} rows -> {chunk_kept:,} kept")
         
-        print(f"\nTotal: {total_rows:,} rows -> {kept_rows:,} kept")
+        self.logger.info(f"\nTotal: {total_rows:,} rows -> {kept_rows:,} kept")
         
         if not filtered_chunks:
-            print("\nERROR: No data kept after filtering!")
+            self.logger.info("\nERROR: No data kept after filtering!")
             return pandas.DataFrame()
         
         chargeData = pandas.concat(filtered_chunks, ignore_index=True)
@@ -420,7 +422,7 @@ class HospitalChargeETLCSV:
                         total_time = batch_end - start_time
                         avg_time_per_record = total_time / num_records
                         
-                        print(f"Processed {num_records:,} records in {total_time:.2f}s "
+                        self.logger.info(f"Processed {num_records:,} records in {total_time:.2f}s "
                               f"(batch: {batch_time:.2f}s, avg: {avg_time_per_record*1000:.2f}ms/record)")
                         
                         services_batch = []
@@ -438,14 +440,14 @@ class HospitalChargeETLCSV:
                 
                 end_time = time.time()
                 total_time = end_time - start_time
-                print(f"\n=== Insertion Complete ===")
-                print(f"Total records processed: {num_records:,}")
-                print(f"Actual insertions:")
-                print(f"  Services: {total_services_inserted:,}")
-                print(f"  Standard Charges: {total_standard_charges_inserted:,}")
-                print(f"  Payer Charges: {total_payer_charges_inserted:,}")
-                print(f"Total time: {total_time:.2f}s")
-                print(f"Records per second: {num_records/total_time:.2f}")
+                self.logger.info(f"\n=== Insertion Complete ===")
+                self.logger.info(f"Total records processed: {num_records:,}")
+                self.logger.info(f"Actual insertions:")
+                self.logger.info(f"  Services: {total_services_inserted:,}")
+                self.logger.info(f"  Standard Charges: {total_standard_charges_inserted:,}")
+                self.logger.info(f"  Payer Charges: {total_payer_charges_inserted:,}")
+                self.logger.info(f"Total time: {total_time:.2f}s")
+                self.logger.info(f"Records per second: {num_records/total_time:.2f}")
 
     def _execute_batch_upserts(self, cur, services_batch, standard_charges_batch, payer_charges_batch):
         """Execute batch upserts for all three tables"""

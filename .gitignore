@@ -1,3 +1,6 @@
 TestScripts/
 MachineReadableFiles/
 Credentials/
+*/__pycache__
+Scripts/downloads
+Logs
