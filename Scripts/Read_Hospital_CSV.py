@@ -172,11 +172,12 @@ class HospitalChargeETLCSV:
         as_of_date = datetime.date.today()
         last_update = None
         version = None
+        financial_aid_policy = None
         
         for key in metadata.keys():
             normalized = self._normalize_string(key)
             if "license" in normalized and "number" in normalized:
-                hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|OH"
+                hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|" + key[-2:]
             elif "name" in normalized:
                 hospital_name = metadata[key]
             elif "address" in normalized:
@@ -187,6 +188,8 @@ class HospitalChargeETLCSV:
                 last_update = metadata[key]
             elif "version" in normalized:
                 version = metadata[key]
+            elif "financial" and "aid" and "policy" in normalized:
+                financial_aid_policy = metadata[key]
 
         self.hospital_license_number = hospital_license_number
 
@@ -201,8 +204,8 @@ class HospitalChargeETLCSV:
                     WHERE hospital_license_number = (%s)
                 """, (hospital_license_number,))
                 cur.execute("""
-                    INSERT INTO HOSPITALS (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO HOSPITALS (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (hospital_license_number)
                     DO UPDATE SET
                         hospital_name = EXCLUDED.hospital_name, 
@@ -210,8 +213,9 @@ class HospitalChargeETLCSV:
                         hospital_location = EXCLUDED.hospital_location,
                         as_of_date = EXCLUDED.as_of_date,
                         last_update = EXCLUDED.last_update,
-                        version = EXCLUDED.version
-                """, (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version))
+                        version = EXCLUDED.version,
+                        financial_aid_policy = EXCLUDED.financial_aid_policy
+                """, (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy))
 
     def _filter_services(self) -> pandas.DataFrame:
         """Filter services with flexible column discovery and vectorized operations"""
@@ -591,7 +595,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/31-1322863_JAMES-CANCER-HOSPITAL_standardcharges.csv"
+    file_path = "../MachineReadableFiles/big_file.csv"
 
     etl = HospitalChargeETLCSV(db_connection_str, file_path)
     result = etl.execute()
