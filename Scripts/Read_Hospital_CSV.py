@@ -7,7 +7,7 @@ import time
 import re
 import traceback
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Iterable
 
 
 class HospitalChargeETLCSV:
@@ -123,6 +123,26 @@ class HospitalChargeETLCSV:
             filter_time = time.time() - filter_start
             self.logger.info(f"Filtering complete in {filter_time:.2f}s")
             
+            matches_found = len(filtered_data)
+            if matches_found == 0:
+                return {
+                'status': 'failed',
+                'error': 'Found no useful data after filtering',
+            }
+
+
+            if(not self._detect_tall(filtered_data)):
+                self.logger.info("\nSTEP 2.5: Wide CSV format detected, converting...")
+                
+
+                convert_start = time.time()
+                filtered_data = self._convert_wide_to_tall(filtered_data)
+                convert_time = time.time() - convert_start
+                
+                self.logger.info(f"Conversion complete in {convert_time:.2f}s")
+                self.logger.info(f"  {matches_found:,} wide rows -> {len(filtered_data):,} tall rows")
+
+
             self.logger.info("\nSTEP 3: Inserting charge data into database...")
             self._arrange_charge_data(filtered_data)
 
@@ -177,7 +197,7 @@ class HospitalChargeETLCSV:
         financial_aid_policy = None
         
         for key in metadata.keys():
-            normalized = self._normalize_string(key)
+            normalized = key.lower()
             if "license" in normalized and "number" in normalized:
                 hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|" + key[-2:]
             elif "name" in normalized:
@@ -371,6 +391,7 @@ class HospitalChargeETLCSV:
                     code_type = row['_matched_type']
                     
                     if not code or not code_type:
+                        logging.error("Matched code or matched type was none")
                         continue  # Should rarely happen since we filtered already
 
                     service_id = sha256(f"{setting}|{code}|{code_type}".encode()).hexdigest()
@@ -496,12 +517,6 @@ class HospitalChargeETLCSV:
 
     # Utility Methods
 
-    def _normalize_string(self, s: str) -> str:
-        """Normalize string for comparison (remove non-alphanumeric, change to lowercase)"""
-        if not s:
-            return ""
-        return re.sub(r'[^a-z0-9]', '', s.lower())
-
     def _discover_columns(self, columns: list[str]) -> dict:
         """Discover column mappings from CSV headers"""
         mapping = {
@@ -516,27 +531,27 @@ class HospitalChargeETLCSV:
         }
         
         for col in columns:
-            normalized = self._normalize_string(col)
+            normalized = col.lower()
 
-            if re.match(r'code\d+$', normalized):
+            if re.match(r'^code\s*\|\s*\d+$', normalized):
                 mapping["code_columns"].append(col)
 
-            elif re.match(r'code\d+type$', normalized):
+            elif re.match(r'^code\s*\|\s*\d+\s*\|\s*type$', normalized):
                 mapping["type_columns"].append(col)
 
             elif "setting" in normalized:
                 mapping["setting"] = col
 
-            elif "description" in normalized or normalized == "desc":
+            elif "description" in normalized:
                 mapping["description"] = col
 
-            elif "payer" in normalized and "name" in normalized:
+            elif "payer_name" in normalized:
                 mapping["payer_name"] = col
 
-            elif "plan" in normalized and "name" in normalized:
+            elif "plan_name" in normalized:
                 mapping["plan_name"] = col
 
-            elif "modifier" in normalized:
+            elif "modifiers" in normalized:
                 mapping["modifiers"] = col
 
             elif "gross" in normalized:
@@ -555,19 +570,19 @@ class HospitalChargeETLCSV:
                 if "dollar" in normalized:
                     mapping["negotiated_dollar"] = col
 
-                elif "percent" in normalized:
+                elif "percentage" in normalized:
                     mapping["negotiated_percentage"] = col
 
                 elif "algorithm" in normalized:
                     mapping["negotiated_algorithm"] = col
 
-            elif "estimated" in normalized:
+            elif "median_amount" in normalized or "estimated_amount" in normalized:
                 mapping["estimated_amount"] = col
 
             elif "methodology" in normalized:
                 mapping["methodology"] = col
 
-            elif "note" in normalized:
+            elif "additional_generic_notes" in normalized:
                 mapping["additional_notes"] = col
             
         return mapping
@@ -589,6 +604,122 @@ class HospitalChargeETLCSV:
         # Default: capitalize first letter
         return setting.capitalize()
 
+    def _detect_tall(self, df: pandas.DataFrame) -> bool:
+        return df.get('payer_name') is not None and df.get('plan_name') is not None
+    
+    def _extract_payer_plan_groups(self, columns: Iterable[str]) -> Dict[Tuple[str, str], Dict[str, str]]:
+        """
+        Extract payer-plan groups from wide format column names.
+        
+        Parses columns like:
+            standard_charge|Aetna|Gold Plan|negotiated_dollar
+            standard_charge|Aetna|Gold Plan|negotiated_percent
+            standard_charge|Blue Cross|PPO|negotiated_dollar
+            estimated_amount|AETNA_MEDICARE_ADVANTAGE_HMO_103003|HMO
+        
+        Returns dict like:
+        {
+            ('Aetna', 'Gold Plan'): {
+                'negotiated_dollar': 'standard_charge|Aetna|Gold Plan|negotiated_dollar',
+                'negotiated_percentage': 'standard_charge|Aetna|Gold Plan|negotiated_percent',
+                ...
+            },
+            ('Blue Cross', 'PPO'): {
+                'negotiated_dollar': 'standard_charge|Blue Cross|PPO|negotiated_dollar',
+                ...
+            }
+        }
+        """
+        groups = {}
+        
+        # Pattern to match: anything|payer|plan|field
+        # The prefix could be "standard_charge" or other variations
+        pattern_4_parts = re.compile(r'^\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*(.+?)\s*$')
+        pattern_3_parts = re.compile(r'^\s*([^|]+)\s*\|\s*([^|]+)\s*\|\s*([^|]+)\s*$')
+        
+        for col in columns:
+            # Try 4-part pattern first
+            match = pattern_4_parts.match(col)
+            if match:
+                prefix, payer_name, plan_name, field = match.groups()
+            else:
+                # Try 3-part pattern
+                match = pattern_3_parts.match(col)
+                if match:
+                    prefix, payer_name, plan_name = match.groups()
+                    field = prefix  # Use prefix as the field name for 3-part columns
+                else:
+                    continue  # No match, skip this column
+            
+            # Clean up payer and plan names (strip whitespace)
+            payer_name = payer_name.strip()
+            plan_name = plan_name.strip()
+            
+            # Create group key
+            group_key = (payer_name, plan_name)
+            
+            if group_key not in groups:
+                groups[group_key] = {}
+            
+            # Store the original column name for this field
+            groups[group_key][field] = col
+        
+        return groups
+
+    def _convert_wide_to_tall(self, df: pandas.DataFrame) -> pandas.DataFrame:
+
+        base_col_names = self._get_base_column_names()
+
+        payer_plan_groups = self._extract_payer_plan_groups(df.columns)
+
+        tall_rows = []
+
+        for _, row in df.iterrows():
+            base_data = {col: row[col] for col in base_col_names if col in df.columns}
+
+            for (payer_name, plan_name), fields in payer_plan_groups.items():
+                # Create new row with base data
+                new_row = base_data.copy()
+                
+                # Add payer and plan names
+                new_row['payer_name'] = payer_name
+                new_row['plan_name'] = plan_name
+                
+                # Add payer-specific charge fields
+                for field_type, col_name in fields.items():
+                    new_row[field_type] = row[col_name] if col_name in df.columns else None
+                
+                tall_rows.append(new_row)
+
+        self.column_mapping['payer_name'] = 'payer_name'
+        self.column_mapping['plan_name'] = 'plan_name'
+        self.column_mapping['negotiated_dollar'] = 'negotiated_dollar'
+        self.column_mapping['negotiated_percentage'] = 'negotiated_percentage'
+        self.column_mapping['negotiated_algorithm'] = 'negotiated_algorithm'
+        self.column_mapping['estimated_amount'] = 'estimated_amount'
+        self.column_mapping['methodology'] = 'methodology'
+
+        return pandas.DataFrame(tall_rows)
+
+    def _get_base_column_names(self) -> List[str]:
+
+        base_cols = [
+            self.column_mapping['setting'], 
+            self.column_mapping['description'], 
+            self.column_mapping['gross'],
+            self.column_mapping['discounted_cash'],
+            self.column_mapping['min'],
+            self.column_mapping['max'],
+            self.column_mapping['modifiers'],
+            self.column_mapping['additional_notes'],
+            '_matched_code',
+            '_matched_type'
+        ]
+
+        return base_cols
+            
+        
+
 if __name__ == "__main__":
     print("Starting ETL process...")
     overall_start = time.time()
@@ -597,7 +728,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/big_file.csv"
+    file_path = "../MachineReadableFiles/wide.csv"
 
     etl = HospitalChargeETLCSV(db_connection_str, file_path)
     result = etl.execute()

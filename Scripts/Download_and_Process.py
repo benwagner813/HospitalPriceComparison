@@ -49,7 +49,15 @@ def download_file(url, download_dir):
         Path to the downloaded file
     """
     print(f"Downloading from {url}...")
-    response = requests.get(url, stream=True)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    response = requests.get(url, headers=headers, stream=True)
     response.raise_for_status()
     
     # Get filename from response or URL
@@ -297,7 +305,7 @@ def main():
     file_name = "cms-hpt.txt"
     download_dir = "./downloads"
 
-    download_file("https://www.mountcarmelhealth.com/sites/default/files/cms-hpt.txt", download_dir)
+    download_file("https://www.mercy.com/cms-hpt.txt", download_dir)
     with open(download_dir + "/" + file_name, "r") as f:
         for line in f:
             if "location-name" in line:
@@ -306,7 +314,7 @@ def main():
                 urls.append(line[line.find(":") + 1:].strip())
 
     
-    # Optional: specify which file types to extract from zips
+    # Optional: specify which file types to extract from zips   
     # This will ignore readme files, metadata, etc.
     target_extensions = ['.csv', '.json', '.txt']  # Or None to extract everything
     
