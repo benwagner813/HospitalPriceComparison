@@ -86,7 +86,7 @@ class HospitalChargeETLCSV:
         self.file_path = file_path
 
         # State tracking
-        self.hospital_license_number = None
+        self.hospital_name = None
         self.encoding = 'latin1'
         self.column_mapping = {}
         self.filtered_data = None
@@ -152,13 +152,13 @@ class HospitalChargeETLCSV:
             self.logger.info("ETL PROCESS COMPLETE")
             self.logger.info("="*70)
             self.logger.info(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
-            self.logger.info(f"Hospital: {self.hospital_license_number}")
+            self.logger.info(f"Hospital: {self.hospital_name}")
             self.logger.info(f"Records inserted: {self.total_rows_found:,}\n\n\n")
 
             return {
                 'status': 'success',
                 'execution_time': overall_time,
-                'hospital_license_number': self.hospital_license_number,
+                'hospital_license_number': self.hospital_name,
                 'records_processed': self.total_rows_processed,
                 'records_inserted': self.total_rows_found,
             }
@@ -188,6 +188,7 @@ class HospitalChargeETLCSV:
         """Upsert hospital metadata into database"""
         
         hospital_license_number = ""
+        hospital_national_provider_identifiers = None
         hospital_name = None
         hospital_address = None
         hospital_location = None
@@ -212,32 +213,35 @@ class HospitalChargeETLCSV:
                 version = metadata[key]
             elif "financial" and "aid" and "policy" in normalized:
                 financial_aid_policy = metadata[key]
+            elif "type_2_npi" in normalized:
+                hospital_national_provider_identifiers = metadata[key]
 
-        self.hospital_license_number = hospital_license_number
+        self.hospital_name = hospital_name
 
         with psycopg.connect(self.db_connection_str) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     DELETE FROM standard_charges
-                    WHERE hospital_license_number = (%s)
-                """, (hospital_license_number,))
+                    WHERE hospital_name = (%s)
+                """, (hospital_name,))
                 cur.execute("""
                     DELETE FROM payer_charges
-                    WHERE hospital_license_number = (%s)
-                """, (hospital_license_number,))
+                    WHERE hospital_name = (%s)
+                """, (hospital_name,))
                 cur.execute("""
-                    INSERT INTO HOSPITALS (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (hospital_license_number)
+                    INSERT INTO HOSPITALS (hospital_name, hospital_license_number, hospital_national_provider_identifiers, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (hospital_name)
                     DO UPDATE SET
-                        hospital_name = EXCLUDED.hospital_name, 
+                        hospital_license_number = EXCLUDED.hospital_license_number,
+                        hospital_national_provider_identifiers = EXCLUDED.hospital_national_provider_identifiers, 
                         hospital_address = EXCLUDED.hospital_address,
                         hospital_location = EXCLUDED.hospital_location,
                         as_of_date = EXCLUDED.as_of_date,
                         last_update = EXCLUDED.last_update,
                         version = EXCLUDED.version,
                         financial_aid_policy = EXCLUDED.financial_aid_policy
-                """, (hospital_license_number, hospital_name, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy))
+                """, (hospital_name, hospital_license_number, hospital_national_provider_identifiers, hospital_address, hospital_location, as_of_date, last_update, version, financial_aid_policy))
 
     def _filter_services(self) -> pandas.DataFrame:
         """Filter services with flexible column discovery and vectorized operations"""
@@ -394,9 +398,11 @@ class HospitalChargeETLCSV:
                         logging.error("Matched code or matched type was none")
                         continue  # Should rarely happen since we filtered already
 
-                    service_id = sha256(f"{setting}|{code}|{code_type}".encode()).hexdigest()
+                    modifiers = row[self.column_mapping['modifiers']] if self.column_mapping['modifiers'] else None
 
-                    services_batch.append((service_id, setting, code, description, code_type))
+                    service_id = sha256(f"{setting}|{code}|{code_type}|{modifiers}".encode()).hexdigest()
+
+                    services_batch.append((service_id, setting, code, description, code_type, modifiers))
                     
                     # Get standard charges (using column mapping)
                     gross = row[self.column_mapping['gross']] if self.column_mapping['gross'] else None
@@ -406,28 +412,33 @@ class HospitalChargeETLCSV:
                     
                     standard_charges_batch.append((
                         service_id, 
-                        self.hospital_license_number, 
+                        self.hospital_name, 
                         gross, discounted, min_charge, max_charge
                     ))
                     
                     # Get payer charges (using column mapping)
                     payer_name = row[self.column_mapping['payer_name']] if self.column_mapping['payer_name'] else None
                     plan_name = row[self.column_mapping['plan_name']] if self.column_mapping['plan_name'] else None
-                    modifiers = row[self.column_mapping['modifiers']] if self.column_mapping['modifiers'] else None
                     negotiated_dollar = row[self.column_mapping['negotiated_dollar']] if self.column_mapping['negotiated_dollar'] else None
                     negotiated_algorithm = row[self.column_mapping['negotiated_algorithm']] if self.column_mapping['negotiated_algorithm'] else None
                     negotiated_percentage = row[self.column_mapping['negotiated_percentage']] if self.column_mapping['negotiated_percentage'] else None
                     estimated_amount = row[self.column_mapping['estimated_amount']] if self.column_mapping['estimated_amount'] else None
                     methodology = row[self.column_mapping['methodology']] if self.column_mapping['methodology'] else None
                     additional_notes = row[self.column_mapping['additional_notes']] if self.column_mapping['additional_notes'] else None
-                    
+                    median_amount = row[self.column_mapping['median_amount']] if self.column_mapping['median_amount'] else None
+                    tenth_percentile_amount = row[self.column_mapping['tenth_percentile_amount']] if self.column_mapping['tenth_percentile_amount'] else None
+                    ninetieth_percentile_amount = row[self.column_mapping['ninetieth_percentile_amount']] if self.column_mapping['ninetieth_percentile_amount'] else None
+                    count_amounts = row[self.column_mapping['count_amounts']] if self.column_mapping['count_amounts'] else None
+
                     if payer_name is not None and plan_name is not None:
                         payer_charges_batch.append((
                             service_id,
-                            self.hospital_license_number, 
-                            payer_name, plan_name, modifiers,
+                            self.hospital_name, 
+                            payer_name, plan_name,
                             negotiated_dollar, negotiated_algorithm, negotiated_percentage,
-                            estimated_amount, methodology, additional_notes
+                            estimated_amount, methodology, additional_notes,
+                            median_amount, tenth_percentile_amount, ninetieth_percentile_amount,
+                            count_amounts
                         ))
 
                     num_records += 1
@@ -478,17 +489,17 @@ class HospitalChargeETLCSV:
         
         if services_batch:
             cur.executemany("""
-                INSERT INTO services (service_id, setting, code, description, type)
-                VALUES(%s, %s, %s, %s, %s)
+                INSERT INTO services (service_id, setting, code, description, type, modifiers)
+                VALUES(%s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
             """, services_batch)
             services_inserted = cur.rowcount
         
         if standard_charges_batch:
             cur.executemany("""
-                INSERT INTO standard_charges (service_id, hospital_license_number, standard_charge_gross, standard_charge_discounted_cash, standard_charge_min, standard_charge_max)
+                INSERT INTO standard_charges (service_id, hospital_name, standard_charge_gross, standard_charge_discounted_cash, standard_charge_min, standard_charge_max)
                 VALUES(%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (service_id, hospital_license_number)
+                ON CONFLICT (service_id, hospital_name)
                 DO UPDATE SET 
                     standard_charge_gross = COALESCE(EXCLUDED.standard_charge_gross, standard_charges.standard_charge_gross),
                     standard_charge_discounted_cash = COALESCE(EXCLUDED.standard_charge_discounted_cash, standard_charges.standard_charge_discounted_cash),
@@ -499,17 +510,20 @@ class HospitalChargeETLCSV:
         
         if payer_charges_batch:
             cur.executemany("""
-                INSERT INTO payer_charges (service_id, hospital_license_number, payer_name, plan_name, modifiers, standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent, estimated_amount, standard_charge_methodology, additional_generic_notes)
-                VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (service_id, hospital_license_number, payer_name, plan_name)
+                INSERT INTO payer_charges (service_id, hospital_name, payer_name, plan_name, standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent, estimated_amount, standard_charge_methodology, additional_generic_notes, median_amount, tenth_percentile_amount, ninetieth_percentile_amount, count_amounts)
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (service_id, hospital_name, payer_name, plan_name)
                 DO UPDATE SET
-                    modifiers = EXCLUDED.modifiers,
                     standard_charge_negotiated_dollar = EXCLUDED.standard_charge_negotiated_dollar,
                     standard_charge_negotiated_algorithm = EXCLUDED.standard_charge_negotiated_algorithm,
                     standard_charge_negotiated_percent = EXCLUDED.standard_charge_negotiated_percent,
                     estimated_amount = EXCLUDED.estimated_amount,
                     standard_charge_methodology = EXCLUDED.standard_charge_methodology,
-                    additional_generic_notes = EXCLUDED.additional_generic_notes
+                    additional_generic_notes = EXCLUDED.additional_generic_notes,
+                    median_amount = EXCLUDED.median_amount,
+                    tenth_percentile_amount = EXCLUDED.tenth_percentile_amount,
+                    ninetieth_percentile_amount = EXCLUDED.ninetieth_percentile_amount,
+                    count_amounts = EXCLUDED.count_amounts
             """, payer_charges_batch)
             payer_charges_inserted = cur.rowcount
         
@@ -528,6 +542,8 @@ class HospitalChargeETLCSV:
         "negotiated_dollar": None, "negotiated_percentage": None, 
         "negotiated_algorithm": None,
         "estimated_amount": None, "methodology": None, "additional_notes": None,
+        "median_amount": None, "tenth_percentile_amount": None, "ninetieth_percentile_amount": None,
+        "count_amounts": None,
         }
         
         for col in columns:
@@ -576,7 +592,7 @@ class HospitalChargeETLCSV:
                 elif "algorithm" in normalized:
                     mapping["negotiated_algorithm"] = col
 
-            elif "median_amount" in normalized or "estimated_amount" in normalized:
+            elif "estimated_amount" in normalized:
                 mapping["estimated_amount"] = col
 
             elif "methodology" in normalized:
@@ -585,6 +601,18 @@ class HospitalChargeETLCSV:
             elif "additional_generic_notes" in normalized:
                 mapping["additional_notes"] = col
             
+            elif "median_amount" in normalized:
+                mapping["median_amount"] = col
+
+            elif "10th_percentile" in normalized:
+                mapping["tenth_percentile_amount"] = col
+
+            elif "90th_percentile" in normalized: 
+                mapping["ninetieth_percentile_amount"] = col
+            
+            elif "count" in normalized:
+                mapping["count_amounts"] = col
+
         return mapping
 
     def _normalize_setting(self, setting: str) -> Optional[str]:
@@ -728,7 +756,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/wide.csv"
+    file_path = "../MachineReadableFiles/big_file.csv"
 
     etl = HospitalChargeETLCSV(db_connection_str, file_path)
     result = etl.execute()

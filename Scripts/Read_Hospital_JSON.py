@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import datetime
+import psycopg
 
 class HospitalChargeETLJSON:
 
@@ -62,30 +63,73 @@ class HospitalChargeETLJSON:
 
     def __init__(self, db_connection_str: str, file_path: str):
         logging.basicConfig(filename="../Logs/ETLLogs.log", level=logging.INFO)
+        self.logger = logging.getLogger("ETL Logger")
         self.file_path = file_path
         self.db_connection_str = db_connection_str
 
         self.npis = None
+        self.hospital_name = None
 
 
     def execute(self):
+
+        self.logger.info("="*70)
+        self.logger.info("HOSPITAL CHARGE ETL PROCESS")
+        self.logger.info("="*70)
+        self.logger.info(f"File: {self.file_path}")
+
+        overall_start = time.time()
+
         with open(self.file_path, "r") as fp:
             self.data = json.load(fp)
 
+        self.logger.info("STEP 1: Loading and inserting hospital metadata")
         hospital_data = self._extract_hospital_data()
         self._load_hospital_data(hospital_data)
 
+        self.logger.info("STEP 2: Loading and inserting charge data")
+        total_rows_inserted = self._extract_charge_data()
+
+        overall_time = time.time() - overall_start
+        self.logger.info("\n" + "="*70)
+        self.logger.info("ETL PROCESS COMPLETE")
+        self.logger.info("="*70)
+        self.logger.info(f"Total execution time: {overall_time:.2f}s ({overall_time/60:.2f} minutes)")
+        self.logger.info(f"Hospital: {self.hospital_name}")
+        self.logger.info(f"Records inserted: {total_rows_inserted:,}\n\n\n")
+
+        return {
+            'status': 'success',
+            'execution_time': overall_time,
+            'hospital_license_number': self.hospital_name,
+        }
+
+
     def _extract_hospital_data(self):
         hospital_name: str | None = self.data.get("hospital_name")
+        self.hospital_name = hospital_name
 
-        locations: list | None = self.data.get("location_name")
-        addresses: list | None = self.data.get("hospital_address")
+        locations_list: list | None = self.data.get("location_name")
+        locations = None
+        if locations_list is not None:
+            locations = "|".join(location for location in locations_list) # type: ignore
+
+        addresses_list: list | None = self.data.get("hospital_address")
+        addresses = None
+        if addresses_list is not None:
+            addresses = "|".join(address for address in addresses_list)
+
         license_information: dict | None = self.data.get("license_information")
         as_of_date: datetime.date = datetime.date.today()
         last_update: datetime.date | None = self.data.get("last_updated_on")
         version: str | None = self.data.get("version")
         npis: list | None = self.data.get("type_2_npi")
         financial_aid_policy: str | None = self.data.get("financial_aid_policy")
+        hospital_license_number = None
+
+        if license_information is not None:
+            hospital_license_number = license_information.get("license_number") 
+            hospital_license_number += "|" + license_information.get("state")
 
         if npis is not None:
             result = "|".join(npi for npi in npis)
@@ -95,63 +139,160 @@ class HospitalChargeETLJSON:
         if locations is None: # Handle legacy location key
             locations: list | None = self.data.get("hospital_location")
 
-        return (hospital_name, locations, addresses, license_information, as_of_date, last_update, version, npis, financial_aid_policy)
+        return (hospital_name, hospital_license_number, self.npis, locations, addresses, as_of_date, last_update, version, financial_aid_policy)
 
     def _load_hospital_data(self, hospital_data):
-        print(hospital_data)
+        with psycopg.connect(self.db_connection_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM standard_charges
+                    WHERE hospital_name = (%s)
+                """, (self.hospital_name,))
+                cur.execute("""
+                    DELETE FROM payer_charges
+                    WHERE hospital_name = (%s)
+                """, (self.hospital_name,))
+                cur.execute("""
+                    INSERT INTO HOSPITALS (hospital_name, hospital_license_number, hospital_national_provider_identifiers, hospital_location, hospital_address, as_of_date, last_update, version, financial_aid_policy)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (hospital_name)
+                    DO UPDATE SET
+                        hospital_license_number = EXCLUDED.hospital_license_number,
+                        hospital_national_provider_identifiers = EXCLUDED.hospital_national_provider_identifiers, 
+                        hospital_address = EXCLUDED.hospital_address,
+                        hospital_location = EXCLUDED.hospital_location,
+                        as_of_date = EXCLUDED.as_of_date,
+                        last_update = EXCLUDED.last_update,
+                        version = EXCLUDED.version,
+                        financial_aid_policy = EXCLUDED.financial_aid_policy
+                """, hospital_data)
 
     def _extract_charge_data(self):
+    
+        start_time = time.time()
 
-        ## CREATE THE DATABASE CONNECTION FIRST
+        total_services_inserted = 0
+        total_standard_charges_inserted = 0
+        total_payer_charges_inserted = 0
 
-        standard_charges: list = self.data["standard_charge_information"]
+        with psycopg.connect(self.db_connection_str) as conn:
+            with conn.cursor() as cur:
+                standard_charges: list = self.data["standard_charge_information"]
 
-        services_batch = []
-        standard_charges_batch = []
-        payer_charges_batch = []
+                services_batch = []
+                standard_charges_batch = []
+                payer_charges_batch = []
+                num_records = 0
+                batch_start = time.time()
 
-        for standard_charge in standard_charges:
-            relevant_code = self._relevant_code(standard_charge)
-            if relevant_code is None:
-                continue
-            
-            code_type = relevant_code[0]
-            code = relevant_code[1]
-            description = standard_charge["description"]
+                for standard_charge in standard_charges:
+                    relevant_code = self._relevant_code(standard_charge)
+                    if relevant_code is None:
+                        continue
+                    
+                    code_type = relevant_code[0]
+                    code = relevant_code[1]
+                    description = standard_charge["description"]
 
-            charge_data: list = standard_charge["standard_charges"]
+                    charge_data: list = standard_charge["standard_charges"]
 
-            for charge in charge_data:
-                setting = charge["setting"]
+                    for charge in charge_data:
+                        setting = charge["setting"]
+                        setting = setting.capitalize()
 
-                service_id = sha256(f"{setting}|{code}|{code_type}".encode()).hexdigest()
-                services_batch.append((service_id, setting, code, description, code_type)) # need to add hospital id later
+                        setting1 = "Inpatient"
+                        setting2 = "Outpatient"
 
-                discounted_cash = charge.get("discounted_cash")
-                minimum = charge.get("minimum")
-                maximum = charge.get("maximum")
-                gross = charge.get("gross_charge")
-                
-                standard_charges_batch.append((service_id, gross, discounted_cash, minimum, maximum)) # need to add hospital id later
+                        modifiers = charge.get("modifier_code")
+                        
+                        service_id1 = sha256(f"{setting1}|{code}|{code_type}|{modifiers}".encode()).hexdigest()
+                        service_id2 = sha256(f"{setting2}|{code}|{code_type}|{modifiers}".encode()).hexdigest()
+                        service_id = sha256(f"{setting}|{code}|{code_type}|{modifiers}".encode()).hexdigest()
+                        
+                        if setting == "Both":
+                            services_batch.append((service_id1, setting1, code, description, code_type, modifiers))
+                            services_batch.append((service_id2, setting2, code, description, code_type, modifiers))
+                        else:
+                            services_batch.append((service_id, setting, code, description, code_type, modifiers))
 
-                payers_information = charge.get("payers_information")
+                        discounted_cash = charge.get("discounted_cash")
+                        minimum = charge.get("minimum")
+                        maximum = charge.get("maximum")
+                        gross = charge.get("gross_charge")
+                        additional_generic_notes = charge.get("additional_generic_notes")
+                        
+                        if setting == "Both":
+                            standard_charges_batch.append((service_id1, self.hospital_name, gross, discounted_cash, minimum, maximum))
+                            standard_charges_batch.append((service_id2, self.hospital_name, gross, discounted_cash, minimum, maximum))
+                        else:    
+                            standard_charges_batch.append((service_id, self.hospital_name, gross, discounted_cash, minimum, maximum))
 
-                if payers_information is not None:
-                    for payer in payers_information:
-                        payer_name = payer["payer_name"]
-                        plan_name = payer["plan_name"]
-                        standard_charge_negotiated_dollar = payer.get("standard_charge_dollar")
-                        standard_charge_negotiated_percent = payer.get("standard_charge_percent")
-                        standard_charge_negotiated_algorithm = payer.get("standard_charge_algorithm")
-                        median = payer.get("median_amount")
-                        tenth_percentile = payer.get("10th_percentile")
-                        ninetyth_percentile = payer.get("90th_percentile")
-                        count = payer.get("count")
-                        standard_charge_negotiated_methodology = payer.get("methodology")
+                        payers_information = charge.get("payers_information")
 
-                        payer_charges_batch.append((service_id, payer_name, plan_name, standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, 
-                                                    standard_charge_negotiated_percent, median, tenth_percentile, ninetyth_percentile, count, standard_charge_negotiated_methodology))
+                        if payers_information is not None:
+                            for payer in payers_information:
+                                payer_name = payer["payer_name"]
+                                plan_name = payer["plan_name"]
+                                standard_charge_negotiated_dollar = payer.get("standard_charge_dollar")
+                                standard_charge_negotiated_percent = payer.get("standard_charge_percent")
+                                standard_charge_negotiated_algorithm = payer.get("standard_charge_algorithm")
+                                estimated_amount = payer.get("estimated_amount")
+                                median = payer.get("median_amount")
+                                tenth_percentile = payer.get("10th_percentile")
+                                ninetyth_percentile = payer.get("90th_percentile")
+                                count = payer.get("count")
+                                standard_charge_negotiated_methodology = payer.get("methodology")
+                                if setting == "Both":
+                                    payer_charges_batch.append((service_id1, self.hospital_name, payer_name, plan_name, 
+                                                            standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent,
+                                                            estimated_amount, standard_charge_negotiated_methodology, additional_generic_notes, median, tenth_percentile, 
+                                                            ninetyth_percentile, count))
+                                    payer_charges_batch.append((service_id2, self.hospital_name, payer_name, plan_name, 
+                                                            standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent,
+                                                            estimated_amount, standard_charge_negotiated_methodology, additional_generic_notes, median, tenth_percentile, 
+                                                            ninetyth_percentile, count))
+                                else:
+                                    payer_charges_batch.append((service_id, self.hospital_name, payer_name, plan_name, 
+                                                            standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent,
+                                                            estimated_amount, standard_charge_negotiated_methodology, additional_generic_notes, median, tenth_percentile, 
+                                                            ninetyth_percentile, count))
+                                
+                                num_records += 1
+                            
+                                if num_records % 5000 == 0:
+                                    batch_counts = self._load_charge_batch_data(cur, services_batch, standard_charges_batch, payer_charges_batch)
+                                    total_services_inserted += batch_counts[0]
+                                    total_standard_charges_inserted += batch_counts[1]
+                                    total_payer_charges_inserted += batch_counts[2]
 
+                                    services_batch = []
+                                    standard_charges_batch = []
+                                    payer_charges_batch = []
+
+                                    batch_end = time.time()
+                                    batch_time = batch_end - batch_start
+                                    total_time = batch_end - start_time
+                                    avg_time_per_record = total_time / num_records
+                                    self.logger.info(f"Processed {num_records:,} records in {total_time:.2f}s "
+                                            f"(batch: {batch_time:.2f}s, avg: {avg_time_per_record*1000:.2f}ms/record)")
+                                    batch_start = time.time()
+                if services_batch:
+                    batch_counts = self._load_charge_batch_data(cur, services_batch, standard_charges_batch, payer_charges_batch)
+                    total_services_inserted += batch_counts[0]
+                    total_standard_charges_inserted += batch_counts[1]
+                    total_payer_charges_inserted += batch_counts[2]
+
+                end_time = time.time()
+                total_time = end_time - start_time
+                self.logger.info(f"\n=== Insertion Complete ===")
+                self.logger.info(f"Total records processed: {num_records:,}")
+                self.logger.info(f"Actual insertions:")
+                self.logger.info(f"  Services: {total_services_inserted:,}")
+                self.logger.info(f"  Standard Charges: {total_standard_charges_inserted:,}")
+                self.logger.info(f"  Payer Charges: {total_payer_charges_inserted:,}")
+                self.logger.info(f"Total time: {total_time:.2f}s")
+                self.logger.info(f"Records per second: {num_records/total_time:.2f}")
+                return num_records
 
     def _relevant_code(self, standard_charge) -> tuple[str, str] | None:
         for code in standard_charge["code_information"]:
@@ -160,9 +301,87 @@ class HospitalChargeETLJSON:
         return None
     
     def _load_charge_batch_data(self, cur, services_batch, standard_charges_batch, payer_charges_batch):
+        services_inserted = 0
+        standard_charges_inserted = 0
+        payer_charges_inserted = 0
         
+        if services_batch:
+            # First, check how many would conflict
+            service_ids = [s[0] for s in services_batch]
+            cur.execute("""
+                SELECT service_id FROM services WHERE service_id = ANY(%s)
+            """, (service_ids,))
+            existing_services = {row[0] for row in cur.fetchall()}
+            
+            self.logger.info(f"Services batch: {len(services_batch)} total, {len(existing_services)} conflicts")
+            
+            cur.executemany("""
+                INSERT INTO services (service_id, setting, code, description, type, modifiers)
+                VALUES(%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, services_batch)
+            services_inserted = cur.rowcount
         
-        return
+        if standard_charges_batch:
+            # Check for conflicts
+            keys = [(s[0], s[1]) for s in standard_charges_batch]  # service_id, hospital_name
+            cur.execute("""
+                SELECT service_id, hospital_name 
+                FROM standard_charges 
+                WHERE (service_id, hospital_name) IN (SELECT unnest(%s::text[]), unnest(%s::text[]))
+            """, ([k[0] for k in keys], [k[1] for k in keys]))
+            existing_standard = cur.rowcount
+            
+            self.logger.info(f"Standard charges batch: {len(standard_charges_batch)} total, {existing_standard} conflicts")
+            
+            cur.executemany("""
+                INSERT INTO standard_charges (service_id, hospital_name, standard_charge_gross, standard_charge_discounted_cash, standard_charge_min, standard_charge_max)
+                VALUES(%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (service_id, hospital_name)
+                DO UPDATE SET 
+                    standard_charge_gross = COALESCE(EXCLUDED.standard_charge_gross, standard_charges.standard_charge_gross),
+                    standard_charge_discounted_cash = COALESCE(EXCLUDED.standard_charge_discounted_cash, standard_charges.standard_charge_discounted_cash),
+                    standard_charge_min = COALESCE(EXCLUDED.standard_charge_min, standard_charges.standard_charge_min),
+                    standard_charge_max = COALESCE(EXCLUDED.standard_charge_max, standard_charges.standard_charge_max)                            
+            """, standard_charges_batch)
+            standard_charges_inserted = cur.rowcount
+        
+        if payer_charges_batch:
+            # Check for conflicts
+            keys = [(p[0], p[1], p[2], p[3]) for p in payer_charges_batch]  # service_id, hospital_name, payer_name, plan_name
+            
+            # Sample a few to see what's conflicting
+            if keys:
+                sample_keys = keys[:5]  # Look at first 5
+                for key in sample_keys:
+                    cur.execute("""
+                        SELECT COUNT(*) FROM payer_charges 
+                        WHERE service_id = %s AND hospital_name = %s AND payer_name = %s AND plan_name = %s
+                    """, key)
+                    if cur.fetchone()[0] > 0:
+                        self.logger.info(f"CONFLICT EXAMPLE: service_id={key[0]}, hospital={key[1]}, payer={key[2]}, plan={key[3]}")
+            
+            self.logger.info(f"Payer charges batch: {len(payer_charges_batch)} total")
+            
+            cur.executemany("""
+                INSERT INTO payer_charges (service_id, hospital_name, payer_name, plan_name, standard_charge_negotiated_dollar, standard_charge_negotiated_algorithm, standard_charge_negotiated_percent, estimated_amount, standard_charge_methodology, additional_generic_notes, median_amount, tenth_percentile_amount, ninetieth_percentile_amount, count_amounts)
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (service_id, hospital_name, payer_name, plan_name)
+                DO UPDATE SET
+                    standard_charge_negotiated_dollar = EXCLUDED.standard_charge_negotiated_dollar,
+                    standard_charge_negotiated_algorithm = EXCLUDED.standard_charge_negotiated_algorithm,
+                    standard_charge_negotiated_percent = EXCLUDED.standard_charge_negotiated_percent,
+                    estimated_amount = EXCLUDED.estimated_amount,
+                    standard_charge_methodology = EXCLUDED.standard_charge_methodology,
+                    additional_generic_notes = EXCLUDED.additional_generic_notes,
+                    median_amount = EXCLUDED.median_amount,
+                    tenth_percentile_amount = EXCLUDED.tenth_percentile_amount,
+                    ninetieth_percentile_amount = EXCLUDED.ninetieth_percentile_amount,
+                    count_amounts = EXCLUDED.count_amounts
+            """, payer_charges_batch)
+            payer_charges_inserted = cur.rowcount
+        
+        return (services_inserted, standard_charges_inserted, payer_charges_inserted)
 
 if __name__ == "__main__":
     print("Starting ETL process...")

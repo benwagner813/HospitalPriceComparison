@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from queue import Queue
 from Read_Hospital_CSV import HospitalChargeETLCSV
+from Read_Hospital_JSON import HospitalChargeETLJSON
 
 
 def get_filename_from_url(url, response=None):
@@ -55,21 +56,34 @@ def download_file(url, download_dir):
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         ),
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
     }
-    response = requests.get(url, headers=headers, stream=True)
-    response.raise_for_status()
-    
-    # Get filename from response or URL
-    filename = get_filename_from_url(url, response)
-    download_path = os.path.join(download_dir, filename)
-    
-    with open(download_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-    
-    print(f"Downloaded to {download_path}")
-    return download_path
+    try:
+        response = requests.get(url, headers=headers, stream=True)
+        response.raise_for_status()
+        
+        # Get filename from response or URL
+        filename = get_filename_from_url(url, response)
+        download_path = os.path.join(download_dir, filename)
+        
+        with open(download_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        print(f"Downloaded to {download_path}")
+        return download_path
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            print(f"Access forbidden (403) for {url}. Skipping this file...")
+            return None
+        else:
+            raise
+    except Exception as e:
+        print(f"Error downloading {url}: {str(e)}")
+        return None
 
 
 def unzip_if_needed(file_path, extract_to=None, target_extensions=None):
@@ -104,7 +118,8 @@ def unzip_if_needed(file_path, extract_to=None, target_extensions=None):
     
     # Always include the original zip in cleanup
     cleanup_paths = [file_path]
-    
+    cleanup_paths.extend(extracted_paths)
+
     # If looking for specific extensions, filter for those
     if target_extensions:
         target_files = [
@@ -115,35 +130,49 @@ def unzip_if_needed(file_path, extract_to=None, target_extensions=None):
         if not target_files:
             raise ValueError(f"No files with extensions {target_extensions} found in zip")
         
-        if len(target_files) == 1:
-            # Return the target file, cleanup everything else
-            cleanup_paths.extend([p for p in extracted_paths if p != target_files[0]])
-            return target_files[0], cleanup_paths
-        else:
-            # Multiple target files - return directory, cleanup zip only
-            print(f"Found {len(target_files)} target files: {target_files}")
-            return extract_to, cleanup_paths
+        
+        return target_files[0], cleanup_paths
     
-    # No specific extensions requested
-    if len(extracted_files) == 1:
-        # Single file - return it, cleanup zip
-        return extracted_paths[0], cleanup_paths
-    else:
-        # Multiple files - return directory, cleanup zip only
-        return extract_to, cleanup_paths
+    return extracted_paths[0], cleanup_paths
 
 
 def process_file(file_path):
-    """Process the file - add your custom processing logic here."""
+    """Move through directories and process files"""
+    
+    # Handle directory case (multiple files extracted)
+    if os.path.isdir(file_path):
+        print(f"Processing directory {file_path}...")
+        # Process all CSV/JSON files in the directory
+        for root, dirs, files in os.walk(file_path):
+            for file in files:
+                full_path = os.path.join(root, file)
+                file_extension = os.path.splitext(full_path)[1].lower()
+                if file_extension in ['.csv', '.json']:
+                    process_single_file(full_path)
+        return
+    
+    # Handle single file case
+    process_single_file(file_path)
+
+def process_single_file(file_path):
+    """Process a single file"""
     print(f"Processing {file_path}...")
     
     db_connection_str = ""
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
 
-    etl = HospitalChargeETLCSV(db_connection_str, file_path)
-    result = etl.execute()
-    
+    file_extension = os.path.splitext(file_path)[1].lower()
+
+    if file_extension == '.json':
+        etl = HospitalChargeETLJSON(db_connection_str, file_path)
+        result = etl.execute()
+    elif file_extension == '.csv':
+        etl = HospitalChargeETLCSV(db_connection_str, file_path)
+        result = etl.execute()
+    else:
+        raise ValueError(f"Unsupported file type: {file_extension}. Only .json and .csv are supported.")
+
     print(f"Processing complete: {file_path}")
 
 
@@ -215,7 +244,7 @@ def pipeline_process(urls, download_dir="./downloads", max_buffered=1, target_ex
     
     # Use maxsize to limit queue - this provides backpressure!
     url_queue = Queue(maxsize=max_buffered)
-    result_queue = Queue()
+    result_queue = Queue(maxsize=max_buffered)
     
     # Start download worker thread
     download_thread = threading.Thread(
@@ -241,95 +270,93 @@ def pipeline_process(urls, download_dir="./downloads", max_buffered=1, target_ex
         if status == 'success':
             try:
                 # Process the file
-                # Download thread can only start next download if queue has space
                 process_file(file_path)
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
             finally:
-                # Cleanup immediately after processing
-                if file_path and file_path not in cleanup_paths:
-                    cleanup_paths.append(file_path)
+                # Cleanup - cleanup_paths already contains everything that needs to be deleted
+                # including the zip file and extracted files
                 cleanup(cleanup_paths)
         else:
             # Error case - still cleanup what we can
-            if cleanup_paths:
-                cleanup(cleanup_paths)
+            cleanup(cleanup_paths)
         
     # Wait for threads to finish
     feeder_thread.join()
     download_thread.join()
 
-
-def sequential_process(urls, download_dir="./downloads", target_extensions=None):
-    """
-    Download and process files sequentially (for comparison).
-    Each file is fully downloaded and processed before starting next.
-    
-    Args:
-        urls: List of URL strings to download
-        download_dir: Directory to download files to
-        target_extensions: List of file extensions to extract from zips
-    """
-    os.makedirs(download_dir, exist_ok=True)
-    
-    for url in urls:
-        extracted_path = None
-        cleanup_paths = []
-        
-        try:
-            # Download
-            downloaded_file = download_file(url, download_dir)
-            
-            # Unzip
-            extracted_path, cleanup_paths = unzip_if_needed(
-                downloaded_file,
-                target_extensions=target_extensions
-            )
-            
-            # Process
-            process_file(extracted_path)
-            
-        except Exception as e:
-            print(f"Error with {url}: {e}")
-        
-        finally:
-            # Cleanup
-            if extracted_path and extracted_path not in cleanup_paths:
-                cleanup_paths.append(extracted_path)
-            cleanup(cleanup_paths)
-
-
 def main():
-    # Configuration - just list URLs, filenames are auto-detected
-    urls = []
+    # Configuration - just list URLs, fil enames are auto-detected
+    urls = set()
     file_name = "cms-hpt.txt"
     download_dir = "./downloads"
-
-    download_file("https://www.mercy.com/cms-hpt.txt", download_dir)
-    with open(download_dir + "/" + file_name, "r") as f:
-        for line in f:
-            if "location-name" in line:
-                print(f"Adding MRF for {line[line.find(":") + 1:].strip()} to the list of urls")
-            if "mrf-url" in line:
-                urls.append(line[line.find(":") + 1:].strip())
+    hospital_list = [
+        "https://www.crystalclinic.com/cms-hpt.txt",
+        "https://www.fmchealth.org/cms-hpt.txt",
+        "https://www.genesishcs.org/cms-hpt.txt",
+        "https://www.henrycountyhospital.org/cms-hpt.txt",
+        "https://www.hdh.org/cms-hpt.txt",
+        "https://www.hvch.org/cms-hpt.txt",
+        "https://insightchicago.com/cms-hpt.txt",
+        "https://www.ioshospital.com/cms-hpt.txt",
+        "https://www.kingsdaughtershealth.com/cms-hpt.txt",
+        "https://www.lmhealth.org/cms-hpt.txt",
+        "https://www.madison-health.com/cms-hpt.txt",
+        "https://www.magruderhospital.com/cms-hpt.txt",
+        "https://memorialohio.com/cms-hpt.txt",
+        "https://www.metrohealth.org/cms-hpt.txt",
+        "https://pauldingcountyhospital.com/cms-hpt.txt",
+        "https://www.pomerenehospital.org/cms-hpt.txt",
+        "https://cdn.prod.website-files.com/5ad49dbf3b9e2b3b0ba15f49/695bc312004b2d2b3df8afc8_cms-hpt.txt",
+        "https://www.somc.org/cms-hpt.txt",
+        "https://www.swgeneral.com/cms-hpt.txt",
+        "https://www.southwoodshealth.com/cms-hpt.txt",
+        "https://www.thechristhospital.com/cms-hpt.txt",
+        "https://health.utoledo.edu/cms-hpt.txt",
+        "https://www.trihealth.com/cms-hpt.txt",
+        "https://coshoctonhospital.org/cms-hpt.txt",
+        "https://elch.org/cms-hpt.txt",
+        "https://fultoncountyhealthcenter.org/cms-hpt.txt",
+        "https://www.kch.org/cms-hpt.txt",
+        "https://www.limamemorial.org/cms-hpt.txt",
+        "https://res.cloudinary.com/dpmykpsih/raw/upload/mary-rutan-redesign-site-505/media/r/45d4f28cfbc64b8a92d2c639fa6299d1/cms-hpt.txt",
+        "https://mercer-health.com/cms-hpt.txt",
+        "https://www.parkview.com/cms-hpt.txt",
+        "https://www.summahealth.org/cms-hpt.txt",
+        "https://www.trinitytwincity.org/cms-hpt.txt",
+        "https://my.clevelandclinic.org/cms-hpt.txt",
+        "https://www.mercy.com/-/media/mercy/cms-hpt.txt",
+        "https://ketteringhealth.org/cms-hpt.txt",
+        "https://www.ohiohealth.com/cms-hpt.txt",
+        "https://www.adena.org/cms-hpt.txt",
+        "https://aultman.org/cms-hpt.txt",
+        "https://www.bvhealthsystem.org/cms-hpt.txt",
+        "https://www.uhhospitals.org/cms-hpt.txt",
+        "https://pcl.promedica.org/-/media/pay-my-bill/cms-hpt.txt",
+        "https://www.premierhealth.com/cms-hpt.txt",
+        "https://avitahealth.org/cms-hpt.txt",
+        "https://wexnermedical.osu.edu/cms-hpt.txt"
+    ]
+    for website in hospital_list:
+        download_file(website, download_dir)
+        with open(download_dir + "/" + file_name, "r") as f:
+            for line in f:
+                if "location-name" in line:
+                    print(f"Adding MRF for {line[line.find(":") + 1:].strip()} to the list of urls")
+                if "mrf-url" in line:
+                    urls.add(line[line.find(":") + 1:].strip())
 
     
     # Optional: specify which file types to extract from zips   
     # This will ignore readme files, metadata, etc.
-    target_extensions = ['.csv', '.json', '.txt']  # Or None to extract everything
-    
+    target_extensions = ['.csv', '.json']  # Or None to extract everything
+    num_urls = len(urls)
     print("=" * 50)
-    print("PIPELINED PROCESSING (download next while processing current)")
+    print(f"Found {num_urls} MRFs, beginning processing")
     print("=" * 50)
     # max_buffered=1 means download at most 1 file ahead
     # Increase if you have more disk space and want more parallelism
-    pipeline_process(urls, download_dir, max_buffered=1, target_extensions=target_extensions)
-    
-    # Uncomment below to compare with sequential processing
-    # print("\n" + "=" * 50)
-    # print("SEQUENTIAL PROCESSING (download then process, one at a time)")
-    # print("=" * 50)
-    # sequential_process(urls, download_dir, target_extensions=target_extensions)
+    # pipeline_process(urls, download_dir, max_buffered=3, target_extensions=target_extensions)
 
 
 if __name__ == "__main__":
