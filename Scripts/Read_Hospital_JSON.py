@@ -80,7 +80,7 @@ class HospitalChargeETLJSON:
 
         overall_start = time.time()
 
-        with open(self.file_path, "r") as fp:
+        with open(self.file_path, "r", encoding="utf-8-sig") as fp:
             self.data = json.load(fp)
 
         self.logger.info("STEP 1: Loading and inserting hospital metadata")
@@ -110,6 +110,9 @@ class HospitalChargeETLJSON:
         self.hospital_name = hospital_name
 
         locations_list: list | None = self.data.get("location_name")
+        if locations_list is None: # Handle legacy location key
+            locations_list = self.data.get("hospital_location")
+
         locations = None
         if locations_list is not None:
             locations = "|".join(location for location in locations_list) # type: ignore
@@ -122,9 +125,12 @@ class HospitalChargeETLJSON:
         license_information: dict | None = self.data.get("license_information")
         as_of_date: datetime.date = datetime.date.today()
         last_update: datetime.date | None = self.data.get("last_updated_on")
-        version: str | None = self.data.get("version")
+        version: str | None = self.data.get("version")  
         npis: list | None = self.data.get("type_2_npi")
-        financial_aid_policy: str | None = self.data.get("financial_aid_policy")
+        financial_aid_policy: list | str | None = self.data.get("financial_aid_policy")
+        if isinstance(financial_aid_policy, list):
+            financial_aid_policy = "|".join(str(x) for x in financial_aid_policy if x)
+
         hospital_license_number = None
 
         if license_information is not None:
@@ -135,10 +141,6 @@ class HospitalChargeETLJSON:
             result = "|".join(npi for npi in npis)
             self.npis = result
                 
-
-        if locations is None: # Handle legacy location key
-            locations: list | None = self.data.get("hospital_location")
-
         return (hospital_name, hospital_license_number, self.npis, locations, addresses, as_of_date, last_update, version, financial_aid_policy)
 
     def _load_hospital_data(self, hospital_data):
@@ -391,7 +393,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/standard.json"
+    file_path = "../MachineReadableFiles/310564121_1053339507_dayton-osteopathic-hospital_standardcharges.json"
 
     etl = HospitalChargeETLJSON(db_connection_str, file_path)
     result = etl.execute()

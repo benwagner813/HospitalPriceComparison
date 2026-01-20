@@ -338,13 +338,14 @@ def main():
         "https://wexnermedical.osu.edu/cms-hpt.txt"
     ]
     for website in hospital_list:
-        download_file(website, download_dir)
-        with open(download_dir + "/" + file_name, "r") as f:
-            for line in f:
-                if "location-name" in line:
-                    print(f"Adding MRF for {line[line.find(":") + 1:].strip()} to the list of urls")
-                if "mrf-url" in line:
-                    urls.add(line[line.find(":") + 1:].strip())
+        file_name = download_file(website, download_dir)
+        if file_name is not None:
+            with open(file_name, "r") as f:
+                for line in f:
+                    if "location-name" in line:
+                        print(f"Adding MRF for {line[line.find(":") + 1:].strip()} to the list of urls")
+                    if "mrf-url" in line:
+                        urls.add(line[line.find(":") + 1:].strip())
 
     
     # Optional: specify which file types to extract from zips   
@@ -356,7 +357,7 @@ def main():
     print("=" * 50)
     # max_buffered=1 means download at most 1 file ahead
     # Increase if you have more disk space and want more parallelism
-    # pipeline_process(urls, download_dir, max_buffered=3, target_extensions=target_extensions)
+    pipeline_process(urls, download_dir, max_buffered=3, target_extensions=target_extensions)
 
 
 if __name__ == "__main__":

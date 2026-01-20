@@ -200,7 +200,7 @@ class HospitalChargeETLCSV:
         for key in metadata.keys():
             normalized = key.lower()
             if "license" in normalized and "number" in normalized:
-                hospital_license_number = "".join(c for c in metadata[key] if c.isdigit()) + "|" + key[-2:]
+                hospital_license_number = metadata[key].rsplit('|', 1)[0] + "|" + key[-2:]
             elif "name" in normalized:
                 hospital_name = metadata[key]
             elif "address" in normalized:
@@ -548,6 +548,7 @@ class HospitalChargeETLCSV:
         
         for col in columns:
             normalized = col.lower()
+            normalized = "".join(normalized.split())
 
             if re.match(r'^code\s*\|\s*\d+$', normalized):
                 mapping["code_columns"].append(col)
@@ -576,10 +577,10 @@ class HospitalChargeETLCSV:
             elif "discounted" in normalized:
                 mapping["discounted_cash"] = col
 
-            elif "min" in normalized:
+            elif "standard_charge|min" in normalized:
                 mapping["min"] = col
 
-            elif "max" in normalized:
+            elif "standard_charge|max" in normalized:
                 mapping["max"] = col
 
             elif "negotiated" in normalized:
@@ -610,7 +611,7 @@ class HospitalChargeETLCSV:
             elif "90th_percentile" in normalized: 
                 mapping["ninetieth_percentile_amount"] = col
             
-            elif "count" in normalized:
+            elif normalized == "count" or "count|" in normalized:
                 mapping["count_amounts"] = col
 
         return mapping
@@ -680,9 +681,10 @@ class HospitalChargeETLCSV:
                     continue  # No match, skip this column
             
             # Clean up payer and plan names (strip whitespace)
-            payer_name = payer_name.strip()
-            plan_name = plan_name.strip()
-            
+            payer_name = payer_name.strip().lower()
+            plan_name = plan_name.strip().lower()
+            prefix = prefix.strip().lower()
+            field = field.strip().lower()
             # Create group key
             group_key = (payer_name, plan_name)
             
@@ -756,7 +758,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/big_file.csv"
+    file_path = "../MachineReadableFiles/610927491_mercy-health-marcum-wallace-hospital-llc_standardcharges.csv"
 
     etl = HospitalChargeETLCSV(db_connection_str, file_path)
     result = etl.execute()
