@@ -198,16 +198,16 @@ class HospitalChargeETLCSV:
         financial_aid_policy = None
         
         for key in metadata.keys():
-            normalized = key.lower()
-            if "license" in normalized and "number" in normalized:
+            normalized = key.lower().strip()
+            if "license_number" in normalized:
                 hospital_license_number = metadata[key].rsplit('|', 1)[0] + "|" + key[-2:]
-            elif "name" in normalized:
+            elif "hospital_name" in normalized:
                 hospital_name = metadata[key]
-            elif "address" in normalized:
+            elif "hospital_address" in normalized:
                 hospital_address = metadata[key]
-            elif "location" in normalized:
+            elif "location_name" in normalized or "hospital_location" in normalized:
                 hospital_location = metadata[key]
-            elif "update" in normalized:
+            elif "last_updated_on" in normalized:
                 last_update = metadata[key]
             elif "version" in normalized:
                 version = metadata[key]
@@ -215,6 +215,9 @@ class HospitalChargeETLCSV:
                 financial_aid_policy = metadata[key]
             elif "type_2_npi" in normalized:
                 hospital_national_provider_identifiers = metadata[key]
+        
+        if hospital_national_provider_identifiers is not None:
+            hospital_national_provider_identifiers = "|".join(x.strip() for x in hospital_national_provider_identifiers.split("|"))
 
         self.hospital_name = hospital_name
 
@@ -426,9 +429,9 @@ class HospitalChargeETLCSV:
                     methodology = row[self.column_mapping['methodology']] if self.column_mapping['methodology'] else None
                     additional_notes = row[self.column_mapping['additional_notes']] if self.column_mapping['additional_notes'] else None
                     median_amount = row[self.column_mapping['median_amount']] if self.column_mapping['median_amount'] else None
-                    tenth_percentile_amount = row[self.column_mapping['tenth_percentile_amount']] if self.column_mapping['tenth_percentile_amount'] else None
-                    ninetieth_percentile_amount = row[self.column_mapping['ninetieth_percentile_amount']] if self.column_mapping['ninetieth_percentile_amount'] else None
-                    count_amounts = row[self.column_mapping['count_amounts']] if self.column_mapping['count_amounts'] else None
+                    tenth_percentile_amount = row[self.column_mapping['10th_percentile_amount']] if self.column_mapping['10th_percentile_amount'] else None
+                    ninetieth_percentile_amount = row[self.column_mapping['90th_percentile_amount']] if self.column_mapping['90th_percentile_amount'] else None
+                    count_amounts = row[self.column_mapping['count']] if self.column_mapping['count'] else None
 
                     if payer_name is not None and plan_name is not None:
                         payer_charges_batch.append((
@@ -542,8 +545,8 @@ class HospitalChargeETLCSV:
         "negotiated_dollar": None, "negotiated_percentage": None, 
         "negotiated_algorithm": None,
         "estimated_amount": None, "methodology": None, "additional_notes": None,
-        "median_amount": None, "tenth_percentile_amount": None, "ninetieth_percentile_amount": None,
-        "count_amounts": None,
+        "median_amount": None, "10th_percentile_amount": None, "90th_percentile_amount": None,
+        "count": None,
         }
         
         for col in columns:
@@ -606,13 +609,13 @@ class HospitalChargeETLCSV:
                 mapping["median_amount"] = col
 
             elif "10th_percentile" in normalized:
-                mapping["tenth_percentile_amount"] = col
+                mapping["10th_percentile_amount"] = col
 
             elif "90th_percentile" in normalized: 
-                mapping["ninetieth_percentile_amount"] = col
+                mapping["90th_percentile_amount"] = col
             
             elif normalized == "count" or "count|" in normalized:
-                mapping["count_amounts"] = col
+                mapping["count"] = col
 
         return mapping
 
@@ -726,10 +729,38 @@ class HospitalChargeETLCSV:
         self.column_mapping['negotiated_dollar'] = 'negotiated_dollar'
         self.column_mapping['negotiated_percentage'] = 'negotiated_percentage'
         self.column_mapping['negotiated_algorithm'] = 'negotiated_algorithm'
-        self.column_mapping['estimated_amount'] = 'estimated_amount'
+        self.column_mapping['estimated_amount'] = 'estimated_amount' if self.column_mapping['estimated_amount'] else None
         self.column_mapping['methodology'] = 'methodology'
 
-        return pandas.DataFrame(tall_rows)
+        self.column_mapping['median_amount'] = 'median_amount' if self.column_mapping['median_amount'] else None
+        self.column_mapping['10th_percentile_amount'] = '10th_percentile_amount' if self.column_mapping['10th_percentile_amount'] else None
+        self.column_mapping['90th_percentile_amount'] = '90th_percentile_amount' if self.column_mapping['90th_percentile_amount'] else None
+        self.column_mapping['count'] = 'count' if self.column_mapping['count'] else None
+        
+        tall_df = pandas.DataFrame(tall_rows)
+        numeric_columns = [
+            'negotiated_dollar', 'negotiated_percentage',
+            self.column_mapping['gross'], self.column_mapping['discounted_cash'],
+            self.column_mapping['min'], self.column_mapping['max']
+        ]
+
+        if self.column_mapping['estimated_amount']:
+            numeric_columns.append(self.column_mapping['estimated_amount']) 
+
+        if self.column_mapping['median_amount']:
+            numeric_columns.append(self.column_mapping['median_amount'])
+        
+        if self.column_mapping['10th_percentile_amount']:
+            numeric_columns.append(self.column_mapping['10th_percentile_amount'])
+
+        if self.column_mapping['90th_percentile_amount']:
+            numeric_columns.append(self.column_mapping['90th_percentile_amount'])
+        
+        for col in numeric_columns:
+            if col in tall_df.columns:
+                tall_df[col] = pandas.to_numeric(tall_df[col], errors='coerce')
+        
+        return tall_df
 
     def _get_base_column_names(self) -> List[str]:
 
@@ -748,8 +779,6 @@ class HospitalChargeETLCSV:
 
         return base_cols
             
-        
-
 if __name__ == "__main__":
     print("Starting ETL process...")
     overall_start = time.time()
@@ -758,7 +787,7 @@ if __name__ == "__main__":
     with open("../Credentials/cred.txt", "r") as f:
         db_connection_str = f.readline()
     
-    file_path = "../MachineReadableFiles/610927491_mercy-health-marcum-wallace-hospital-llc_standardcharges.csv"
+    file_path = "../MachineReadableFiles/261130649_crystal-clinic-orthopaedic-center_standardcharges.csv"
 
     etl = HospitalChargeETLCSV(db_connection_str, file_path)
     result = etl.execute()

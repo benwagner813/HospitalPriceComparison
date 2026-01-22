@@ -2,13 +2,16 @@ import os
 import zipfile
 import requests
 import threading
+import re
+import mimetypes
+import time
 from pathlib import Path
 from queue import Queue
 from Read_Hospital_CSV import HospitalChargeETLCSV
 from Read_Hospital_JSON import HospitalChargeETLJSON
+from urllib.parse import urlparse, unquote
 
-
-def get_filename_from_url(url, response=None):
+def get_filename_from_url(response, original_url=None):
     """
     Extract filename from URL or Content-Disposition header.
     
@@ -19,23 +22,32 @@ def get_filename_from_url(url, response=None):
     Returns:
         Filename string
     """
-    # Try to get filename from Content-Disposition header
-    if response and 'Content-Disposition' in response.headers:
-        content_disp = response.headers['Content-Disposition']
-        if 'filename=' in content_disp:
-            filename = content_disp.split('filename=')[1].strip('"\'')
-            return filename
-    
-    # Fall back to URL parsing
-    from urllib.parse import urlparse, unquote
-    parsed = urlparse(url)
+    cd = response.headers.get("Content-Disposition")
+    if cd:
+        # RFC 5987: filename*=UTF-8''encoded.ext
+        match = re.search(r"filename\*\s*=\s*([^']*)''(.+)", cd, re.IGNORECASE)
+        if match:
+            return unquote(match.group(2))
+
+        # Standard filename="file.ext"
+        match = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
+        if match:
+            return match.group(1)
+   
+    parsed = urlparse(response.url)
     filename = os.path.basename(unquote(parsed.path))
-    
-    # If still no filename, generate one
-    if not filename or filename == '':
-        filename = f"download_{hash(url) % 100000}.bin"
-    
-    return filename
+
+    if filename:
+        return filename
+
+    content_type = response.headers.get("Content-Type", "").split(";")[0]
+    ext = mimetypes.guess_extension(content_type)
+
+    if ext:
+        return f"download{ext}"
+
+    base = f"download_{hash(original_url or response.url) % 100000}"
+    return base + ".bin"
 
 
 def download_file(url, download_dir):
@@ -61,11 +73,11 @@ def download_file(url, download_dir):
         "Connection": "keep-alive",
     }
     try:
-        response = requests.get(url, headers=headers, stream=True)
+        response = requests.get(url, headers=headers, allow_redirects=True, stream=True)
         response.raise_for_status()
         
         # Get filename from response or URL
-        filename = get_filename_from_url(url, response)
+        filename = get_filename_from_url(response, url)
         download_path = os.path.join(download_dir, filename)
         
         with open(download_path, 'wb') as f:
@@ -287,56 +299,81 @@ def pipeline_process(urls, download_dir="./downloads", max_buffered=1, target_ex
 
 def main():
     # Configuration - just list URLs, fil enames are auto-detected
+    overall_start = time.time()
+
     urls = set()
     file_name = "cms-hpt.txt"
     download_dir = "./downloads"
     hospital_list = [
-        "https://www.crystalclinic.com/cms-hpt.txt",
-        "https://www.fmchealth.org/cms-hpt.txt",
-        "https://www.genesishcs.org/cms-hpt.txt",
-        "https://www.henrycountyhospital.org/cms-hpt.txt",
-        "https://www.hdh.org/cms-hpt.txt",
-        "https://www.hvch.org/cms-hpt.txt",
-        "https://insightchicago.com/cms-hpt.txt",
-        "https://www.ioshospital.com/cms-hpt.txt",
-        "https://www.kingsdaughtershealth.com/cms-hpt.txt",
-        "https://www.lmhealth.org/cms-hpt.txt",
-        "https://www.madison-health.com/cms-hpt.txt",
-        "https://www.magruderhospital.com/cms-hpt.txt",
-        "https://memorialohio.com/cms-hpt.txt",
-        "https://www.metrohealth.org/cms-hpt.txt",
-        "https://pauldingcountyhospital.com/cms-hpt.txt",
-        "https://www.pomerenehospital.org/cms-hpt.txt",
-        "https://cdn.prod.website-files.com/5ad49dbf3b9e2b3b0ba15f49/695bc312004b2d2b3df8afc8_cms-hpt.txt",
-        "https://www.somc.org/cms-hpt.txt",
-        "https://www.swgeneral.com/cms-hpt.txt",
-        "https://www.southwoodshealth.com/cms-hpt.txt",
-        "https://www.thechristhospital.com/cms-hpt.txt",
-        "https://health.utoledo.edu/cms-hpt.txt",
-        "https://www.trihealth.com/cms-hpt.txt",
-        "https://coshoctonhospital.org/cms-hpt.txt",
-        "https://elch.org/cms-hpt.txt",
-        "https://fultoncountyhealthcenter.org/cms-hpt.txt",
-        "https://www.kch.org/cms-hpt.txt",
-        "https://www.limamemorial.org/cms-hpt.txt",
-        "https://res.cloudinary.com/dpmykpsih/raw/upload/mary-rutan-redesign-site-505/media/r/45d4f28cfbc64b8a92d2c639fa6299d1/cms-hpt.txt",
-        "https://mercer-health.com/cms-hpt.txt",
-        "https://www.parkview.com/cms-hpt.txt",
-        "https://www.summahealth.org/cms-hpt.txt",
-        "https://www.trinitytwincity.org/cms-hpt.txt",
-        "https://my.clevelandclinic.org/cms-hpt.txt",
-        "https://www.mercy.com/-/media/mercy/cms-hpt.txt",
-        "https://ketteringhealth.org/cms-hpt.txt",
-        "https://www.ohiohealth.com/cms-hpt.txt",
-        "https://www.adena.org/cms-hpt.txt",
-        "https://aultman.org/cms-hpt.txt",
-        "https://www.bvhealthsystem.org/cms-hpt.txt",
+        "https://acrmc.com/wp-content/uploads/2025/03/cms-hpt.txt",
+        "https://res.cloudinary.com/dpmykpsih/raw/upload/acmc-site-340/media/r/bf353e0b1e8e45c39fcbd6537ba77aae/cms-hpt.txt",
+        "https://estimator.myinsightcare.com/cms-hpt.txt",
+        "https://www.nationwidechildrens.org/cms-hpt.txt",
+        "https://www.ovsurgical.com/cms-hpt.txt",
+        "https://trinityhealth.com/cms-hpt.txt",
+        "https://www.waynehealthcare.org/cms-hpt.txt",
+        "https://www.westernreservehospital.org/sites/default/files/cms-hpt.txt",
+        "https://www.wilsonhealth.org/cms-hpt.txt",
+        "https://www.woodcountyhospital.org/cms-hpt.txt",
+        "https://www.woosterhospital.org/cms-hpt.txt",
+        "https://www.wyandotmemorial.org/cms-hpt.txt",
+        "https://wvumedicine.org/cms-hpt.txt",
+        "https://www.uchealth.com/cms-hpt.txt",
+        "https://www.mountcarmelhealth.com/sites/default/files/cms-hpt.txt",
+        "https://www.mhsystem.org/cms-hpt.txt",
+        "https://www.holzer.org/cms-hpt.txt",
         "https://www.uhhospitals.org/cms-hpt.txt",
-        "https://pcl.promedica.org/-/media/pay-my-bill/cms-hpt.txt",
-        "https://www.premierhealth.com/cms-hpt.txt",
-        "https://avitahealth.org/cms-hpt.txt",
-        "https://wexnermedical.osu.edu/cms-hpt.txt"
+        "https://www.firelands.com/cms-hpt.txt",
+        "https://childrensdayton.org/cms-hpt.txt",
+        "https://www.cincinnatichildrens.org/cms-hpt.txt",
+        "https://www.akronchildrens.org/cms-hpt.txt",
+        # "https://www.crystalclinic.com/cms-hpt.txt",
+        # "https://www.fmchealth.org/cms-hpt.txt",
+        # "https://www.genesishcs.org/cms-hpt.txt",
+        # "https://www.henrycountyhospital.org/cms-hpt.txt",
+        # "https://www.hdh.org/cms-hpt.txt",
+        # "https://www.hvch.org/cms-hpt.txt",
+        # "https://insightchicago.com/cms-hpt.txt",
+        # "https://www.ioshospital.com/cms-hpt.txt",
+        # "https://www.kingsdaughtershealth.com/cms-hpt.txt",
+        # "https://www.lmhealth.org/cms-hpt.txt",
+        # "https://www.madison-health.com/cms-hpt.txt",
+        # "https://www.magruderhospital.com/cms-hpt.txt",
+        # "https://memorialohio.com/cms-hpt.txt",
+        # "https://www.metrohealth.org/cms-hpt.txt",
+        # "https://pauldingcountyhospital.com/cms-hpt.txt",
+        # "https://www.pomerenehospital.org/cms-hpt.txt",
+        # "https://cdn.prod.website-files.com/5ad49dbf3b9e2b3b0ba15f49/695bc312004b2d2b3df8afc8_cms-hpt.txt",
+        # "https://www.somc.org/cms-hpt.txt",
+        # "https://www.swgeneral.com/cms-hpt.txt",
+        # "https://www.southwoodshealth.com/cms-hpt.txt",
+        # "https://www.thechristhospital.com/cms-hpt.txt",
+        # "https://health.utoledo.edu/cms-hpt.txt",
+        # "https://www.trihealth.com/cms-hpt.txt",
+        # "https://coshoctonhospital.org/cms-hpt.txt",
+        # "https://elch.org/cms-hpt.txt",
+        # "https://fultoncountyhealthcenter.org/cms-hpt.txt",
+        # "https://www.kch.org/cms-hpt.txt",
+        # "https://www.limamemorial.org/cms-hpt.txt",
+        # "https://res.cloudinary.com/dpmykpsih/raw/upload/mary-rutan-redesign-site-505/media/r/45d4f28cfbc64b8a92d2c639fa6299d1/cms-hpt.txt",
+        # "https://mercer-health.com/cms-hpt.txt",
+        # "https://www.parkview.com/cms-hpt.txt",
+        # "https://www.summahealth.org/cms-hpt.txt",
+        # "https://www.trinitytwincity.org/cms-hpt.txt",
+        # "https://my.clevelandclinic.org/cms-hpt.txt",
+        # "https://www.mercy.com/-/media/mercy/cms-hpt.txt",
+        # "https://ketteringhealth.org/cms-hpt.txt",
+        # "https://www.ohiohealth.com/cms-hpt.txt",
+        # "https://www.adena.org/cms-hpt.txt",
+        # "https://aultman.org/cms-hpt.txt",
+        # "https://www.bvhealthsystem.org/cms-hpt.txt",
+        # "https://www.uhhospitals.org/cms-hpt.txt",
+        # "https://pcl.promedica.org/-/media/pay-my-bill/cms-hpt.txt",
+        # "https://www.premierhealth.com/cms-hpt.txt",
+        # "https://avitahealth.org/cms-hpt.txt",
+        # "https://wexnermedical.osu.edu/cms-hpt.txt",
     ]
+
     for website in hospital_list:
         file_name = download_file(website, download_dir)
         if file_name is not None:
@@ -347,7 +384,8 @@ def main():
                     if "mrf-url" in line:
                         urls.add(line[line.find(":") + 1:].strip())
 
-    
+    file_name = download_file("https://urldefense.com/v3/__https://hospitalpricedisclosure.com/download.aspx?pi=WJKzY1WfxL9tY*__*rvbuKxvw*-*__;KioqKg!!P9Xnu6eaQvFHhbdAE0-F5A!saewjBGHS4GsuJknkffuFQqKgq-h88YcMSevwk0zZkROIZEATF3T3ig7BWKG-ZecarTsl9EC8hwW3_cV6p-_51OodIg$", download_dir)
+    print(f"Found file: {file_name}")
     # Optional: specify which file types to extract from zips   
     # This will ignore readme files, metadata, etc.
     target_extensions = ['.csv', '.json']  # Or None to extract everything
@@ -358,6 +396,9 @@ def main():
     # max_buffered=1 means download at most 1 file ahead
     # Increase if you have more disk space and want more parallelism
     pipeline_process(urls, download_dir, max_buffered=3, target_extensions=target_extensions)
+    total_time = time.time() - overall_start
+
+    print(f"The process took {total_time:.2f}s")
 
 
 if __name__ == "__main__":
